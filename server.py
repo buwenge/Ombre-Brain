@@ -1905,8 +1905,6 @@ async def api_system_status(request):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-
-# --- Entry point / 启动入口 ---
 # =============================================================
 # Tool: mood — Read current mood snapshot
 # 工具：mood — 读取当前心情快照
@@ -1918,21 +1916,14 @@ async def mood() -> str:
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         snapshot = compute_mood_snapshot(all_buckets)
-
         lines = [f"【当下心情状态】\n{snapshot['description']}"]
-
         if snapshot["high_arousal"]:
             lines.append(f"近期高唤醒词：{'、'.join(snapshot['high_arousal'])}")
-
-        # 内部数值（供参考，不要直接对用户说出）
         lines.append(f"[PA={snapshot['pa']:.2f} NA={snapshot['na']:.2f}]")
-
         return "\n".join(lines)
-
     except Exception as e:
         logger.warning(f"Mood snapshot failed: {e}")
         return "心情系统暂时无法读取，继续正常对话。"
-        
 if __name__ == "__main__":
     transport = config.get("transport", "stdio")
     logger.info(f"Ombre Brain starting | transport: {transport}")
