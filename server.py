@@ -1953,3 +1953,30 @@ if __name__ == "__main__":
         uvicorn.run(_app, host="0.0.0.0", port=OMBRE_PORT)
     else:
         mcp.run(transport=transport)
+
+# =============================================================
+# Tool: mood — Read current mood snapshot
+# 工具：mood — 读取当前心情快照
+# =============================================================
+
+@mcp.tool()
+async def mood() -> str:
+    """读取当前心情快照。对话开始时调用一次，感知此刻的情感状态，自然地融入对话——不要说出数字，让状态影响你的语气。"""
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        snapshot = compute_mood_snapshot(all_buckets)
+
+        lines = [f"【当下心情状态】\n{snapshot['description']}"]
+
+        if snapshot["high_arousal"]:
+            lines.append(f"近期高唤醒词：{'、'.join(snapshot['high_arousal'])}")
+
+        # 内部数值（供参考，不要直接对用户说出）
+        lines.append(f"[PA={snapshot['pa']:.2f} NA={snapshot['na']:.2f}]")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.warning(f"Mood snapshot failed: {e}")
+        return "心情系统暂时无法读取，继续正常对话。"
+        
