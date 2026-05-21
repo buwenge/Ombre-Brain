@@ -55,7 +55,7 @@ from bucket_manager import BucketManager
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
-from import_memory import ImportEngine
+from mood_engine import compute_mood_snapshot
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
