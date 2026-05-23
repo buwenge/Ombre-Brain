@@ -925,29 +925,12 @@ async def grow(content: str) -> str:
         action = "合并" if is_merged else "新建"
         return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
 
-    # --- Step 1: split by separator, no LLM rewrite ---
-    import re
-    raw_chunks = re.split(r'\n---\n|^---$', content, flags=re.MULTILINE)
-    chunks = [c.strip() for c in raw_chunks if c.strip() and len(c.strip()) >= 10]
-    if not chunks:
-        chunks = [content.strip()]
-
-    items = []
-    for chunk in chunks:
-        try:
-            analysis = await dehydrator.analyze(chunk)
-        except Exception as e:
-            logger.warning(f"Analyze failed: {e}")
-            analysis = {"domain": ["未分类"], "valence": 0.5, "arousal": 0.3, "tags": [], "suggested_name": ""}
-        items.append({
-            "content": chunk,
-            "name": analysis.get("suggested_name", ""),
-            "domain": analysis.get("domain", ["未分类"]),
-            "valence": analysis.get("valence", 0.5),
-            "arousal": analysis.get("arousal", 0.3),
-            "tags": analysis.get("tags", []),
-            "importance": 5,
-        })
+    # --- Step 1: let API split and organize / 让 API 拆分整理 ---
+    try:
+        items = await dehydrator.digest(content)
+    except Exception as e:
+        logger.error(f"Diary digest failed / 日记整理失败: {e}")
+        return f"日记整理失败: {e}"
 
     if not items:
         return "内容为空或整理失败。"
