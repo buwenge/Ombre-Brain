@@ -505,28 +505,31 @@ class Dehydrator:
     # 给 grow 工具用，"一天结束发一坨内容"靠这个
     # ---------------------------------------------------------
     async def digest(self, content: str) -> list[dict]:
-        """
-        Split a large chunk of daily content into independent memory entries.
-        将一大段日常内容拆分成多个独立记忆条目。
+        """按分隔符拆分原文，不调用LLM改写内容。"""
+        import re
+        raw_chunks = re.split(r'\n---\n|^---$', content, flags=re.MULTILINE)
+        chunks = [c.strip() for c in raw_chunks if c.strip() and len(c.strip()) >= 10]
+        if not chunks:
+            chunks = [content.strip()] if content.strip() else []
 
-        Returns: [{"name", "content", "domain", "valence", "arousal", "tags", "importance"}, ...]
-        """
-        if not content or not content.strip():
-            return []
-
-        # --- API digest (no local fallback) ---
-        if not self.api_available:
-            raise RuntimeError("脱水 API 不可用，请检查 config.yaml 中的 dehydration 配置")
-        try:
-            result = await self._api_digest(content)
-            if result:
-                return result
-            raise RuntimeError("API 日记整理返回空结果")
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise RuntimeError(f"API 日记整理失败，请检查 API 连接: {e}") from e
-
+        items = []
+        for chunk in chunks:
+            try:
+                analysis = await self.analyze(chunk)
+            except Exception as e:
+                logger.warning(f"Analyze failed: {e}")
+                analysis = {"domain": ["未分类"], "valence": 0.5,
+                            "arousal": 0.3, "tags": [], "suggested_name": ""}
+            items.append({
+                "content": chunk,
+                "name": analysis.get("suggested_name", ""),
+                "domain": analysis.get("domain", ["未分类"]),
+                "valence": analysis.get("valence", 0.5),
+                "arousal": analysis.get("arousal", 0.3),
+                "tags": analysis.get("tags", []),
+                "importance": 5,
+            })
+        return items
     # ---------------------------------------------------------
     # API call: diary digest
     # API 调用：日记整理
