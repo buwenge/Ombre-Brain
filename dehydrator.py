@@ -253,6 +253,11 @@ class Dehydrator:
         if not content or not content.strip():
             return "（空记忆 / empty memory）"
 
+        # --- Verbatim mode: skip dehydration, return content as-is ---
+        # --- 原样模式：跳过脱水，直接返回原始内容 ---
+        if metadata and metadata.get("verbatim"):
+            return self._format_output(content, metadata)
+
         # --- Content is short enough, no compression needed ---
         # --- 内容已经很短，不需要压缩 ---
         if count_tokens_approx(content) < 100:
