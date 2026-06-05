@@ -505,11 +505,31 @@ async def breath(
     arousal: float = -1,
     max_results: int = 20,
     importance_min: int = -1,
+    bucket_id: str = "",
+    limit: int = -1,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制浮现模式返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。bucket_id传入桶ID时直接获取该桶内容返回(不走搜索)。limit>=1时在关键词搜索模式下限制返回条数(不填则返回所有匹配结果)。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
+
+    # --- bucket_id mode: fetch single bucket by ID ---
+    # --- 桶ID模式：直接按ID获取单个桶 ---
+    if bucket_id and bucket_id.strip():
+        try:
+            bucket = await bucket_mgr.get(bucket_id.strip())
+            if not bucket:
+                return f"未找到桶 {bucket_id}"
+            clean_meta = {k: v for k, v in bucket["metadata"].items() if k != "tags"}
+            is_verbatim = bucket["metadata"].get("verbatim", False)
+            if is_verbatim:
+                clean_meta["verbatim"] = True
+            summary = await dehydrator.dehydrate(strip_wikilinks(bucket["content"]), clean_meta)
+            await bucket_mgr.touch(bucket["id"])
+            return f"[bucket_id:{bucket['id']}] {summary}"
+        except Exception as e:
+            logger.error(f"Bucket ID fetch failed / 桶ID获取失败: {e}")
+            return f"获取桶 {bucket_id} 失败: {e}"
 
     # --- importance_min mode: bulk fetch by importance threshold ---
     # --- 重要度批量拉取模式：跳过语义搜索，按 importance 降序返回 ---
@@ -695,25 +715,29 @@ async def breath(
         logger.error(f"Search failed / 检索失败: {e}")
         return "检索过程出错，请稍后重试。"
 
-    # --- Exclude pinned/protected from search results (they surface in surfacing mode) ---
-    # --- 搜索模式排除钉选桶（它们在浮现模式中始终可见）---
-    matches = [b for b in matches if not (b["metadata"].get("pinned") or b["metadata"].get("protected"))]
+    # --- Pinned/protected buckets are now included in search results ---
+    # --- 钉选桶现在也参与搜索结果 ---
 
     # --- Vector similarity channel: find semantically related buckets ---
     # --- 向量相似度通道：找到语义相关的桶 ---
     matched_ids = {b["id"] for b in matches}
     try:
         vector_results = await embedding_engine.search_similar(query, top_k=max(max_results, 20))
-        for bucket_id, sim_score in vector_results:
-            if bucket_id not in matched_ids and sim_score > 0.5:
-                bucket = await bucket_mgr.get(bucket_id)
-                if bucket and not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
+        for vid, sim_score in vector_results:
+            if vid not in matched_ids and sim_score > 0.5:
+                bucket = await bucket_mgr.get(vid)
+                if bucket:
                     bucket["score"] = round(sim_score * 100, 2)
                     bucket["vector_match"] = True
                     matches.append(bucket)
-                    matched_ids.add(bucket_id)
+                    matched_ids.add(vid)
     except Exception as e:
         logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
+
+    # --- Apply limit to search results if specified ---
+    # --- 如果指定了 limit，截取搜索结果前 N 条 ---
+    if limit >= 1:
+        matches = matches[:limit]
 
     results = []
     token_used = 0
