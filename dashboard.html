@@ -1178,6 +1178,13 @@ async function showDetail(id) {
     var meta = b.metadata || {};
     content.innerHTML =
       '<h2>' + esc(meta.name || id) + '</h2>' +
+      '<div style="display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap;">' +
+        '<button class="btn-primary" style="padding:8px 16px;font-size:12px;" onclick="toggleEditMode(\'' + id + '\')">✏️ 编辑</button>' +
+        '<button style="padding:8px 16px;font-size:12px;background:none;border:1px solid var(--border);border-radius:20px;cursor:pointer;color:var(--accent);" onclick="quickAction(\'' + id + '\',\'pin\',' + (meta.pinned ? 'false' : 'true') + ')">' + (meta.pinned ? '📌 取消钉选' : '📌 钉选') + '</button>' +
+        '<button style="padding:8px 16px;font-size:12px;background:none;border:1px solid var(--border);border-radius:20px;cursor:pointer;color:var(--accent);" onclick="quickAction(\'' + id + '\',\'resolve\',' + (meta.resolved ? 'false' : 'true') + ')">' + (meta.resolved ? '⚡ 重新激活' : '💤 沉底') + '</button>' +
+        '<button style="padding:8px 16px;font-size:12px;background:none;border:1px solid var(--border);border-radius:20px;cursor:pointer;color:var(--negative);" onclick="if(confirm(\'确定删除该记忆桶？此操作不可撤销。\'))deleteBucket(\'' + id + '\')">✕ 删除</button>' +
+      '</div>' +
+      '<div id="detail-status" style="font-size:12px;margin-bottom:10px;"></div>' +
       '<div class="detail-meta">' +
         '<div class="field"><label>ID</label>' + id + '</div>' +
         '<div class="field"><label>类型</label>' + (meta.type || 'dynamic') + '</div>' +
@@ -1195,9 +1202,106 @@ async function showDetail(id) {
         '<div class="field"><label>创建</label>' + (meta.created || '—') + '</div>' +
         '<div class="field"><label>最后活跃</label>' + (meta.last_active || '—') + '</div>' +
       '</div>' +
-      '<div class="detail-content">' + esc(b.content) + '</div>';
+      '<div class="detail-content" id="detail-content-text">' + esc(b.content) + '</div>' +
+      '<div id="edit-form" style="display:none;margin-top:16px;">' +
+        '<div style="margin-bottom:10px;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">桶名</label><input type="text" id="edit-name" value="' + esc(meta.name || '') + '" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
+        '<div style="margin-bottom:10px;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">域（逗号分隔）</label><input type="text" id="edit-domain" value="' + esc((meta.domain || []).join(', ')) + '" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
+        '<div style="margin-bottom:10px;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">标签（逗号分隔）</label><input type="text" id="edit-tags" value="' + esc((meta.tags || []).join(', ')) + '" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
+        '<div style="display:flex;gap:10px;margin-bottom:10px;">' +
+          '<div style="flex:1;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">重要度(1-10)</label><input type="number" id="edit-importance" value="' + (meta.importance || 5) + '" min="1" max="10" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
+          '<div style="flex:1;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">效价(0-1)</label><input type="number" id="edit-valence" value="' + (meta.valence || 0.5) + '" min="0" max="1" step="0.05" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
+          '<div style="flex:1;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">唤醒(0-1)</label><input type="number" id="edit-arousal" value="' + (meta.arousal || 0.3) + '" min="0" max="1" step="0.05" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
+        '</div>' +
+        '<div style="margin-bottom:10px;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">内容</label><textarea id="edit-content" style="width:100%;min-height:200px;padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;line-height:1.7;resize:vertical;font-family:inherit;">' + esc(b.content) + '</textarea></div>' +
+        '<div style="display:flex;gap:8px;">' +
+          '<button class="btn-primary" style="padding:10px 24px;font-size:13px;" onclick="saveBucket(\'' + id + '\')">保存修改</button>' +
+          '<button class="btn-secondary" style="padding:10px 24px;font-size:13px;" onclick="toggleEditMode()">取消</button>' +
+        '</div>' +
+      '</div>';
   } catch (e) {
     content.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
+  }
+}
+
+function toggleEditMode(id) {
+  var form = document.getElementById('edit-form');
+  var contentText = document.getElementById('detail-content-text');
+  if (form.style.display === 'none') {
+    form.style.display = 'block';
+    contentText.style.display = 'none';
+  } else {
+    form.style.display = 'none';
+    contentText.style.display = '';
+  }
+}
+
+async function saveBucket(id) {
+  var statusEl = document.getElementById('detail-status');
+  statusEl.innerHTML = '<span style="color:var(--text-dim);">保存中…</span>';
+  var body = {
+    name: document.getElementById('edit-name').value,
+    domain: document.getElementById('edit-domain').value,
+    tags: document.getElementById('edit-tags').value,
+    importance: parseInt(document.getElementById('edit-importance').value) || 5,
+    valence: parseFloat(document.getElementById('edit-valence').value),
+    arousal: parseFloat(document.getElementById('edit-arousal').value),
+    content: document.getElementById('edit-content').value,
+  };
+  try {
+    var res = await fetch(BASE + '/api/bucket/' + id, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    var data = await res.json();
+    if (data.ok) {
+      statusEl.innerHTML = '<span style="color:var(--positive);">✓ 已保存: ' + data.updated.join(', ') + '</span>';
+      loadBuckets();
+      setTimeout(function() { showDetail(id); }, 500);
+    } else {
+      statusEl.innerHTML = '<span style="color:var(--negative);">✗ ' + (data.error || '保存失败') + '</span>';
+    }
+  } catch (e) {
+    statusEl.innerHTML = '<span style="color:var(--negative);">✗ 请求失败: ' + e.message + '</span>';
+  }
+}
+
+async function quickAction(id, action, value) {
+  var statusEl = document.getElementById('detail-status');
+  statusEl.innerHTML = '<span style="color:var(--text-dim);">处理中…</span>';
+  var body = {};
+  if (action === 'pin') body.pinned = value;
+  if (action === 'resolve') body.resolved = value;
+  try {
+    var res = await fetch(BASE + '/api/bucket/' + id, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    var data = await res.json();
+    if (data.ok) {
+      statusEl.innerHTML = '<span style="color:var(--positive);">✓ 已更新</span>';
+      loadBuckets();
+      setTimeout(function() { showDetail(id); }, 500);
+    } else {
+      statusEl.innerHTML = '<span style="color:var(--negative);">✗ ' + (data.error || '操作失败') + '</span>';
+    }
+  } catch (e) {
+    statusEl.innerHTML = '<span style="color:var(--negative);">✗ 请求失败: ' + e.message + '</span>';
+  }
+}
+
+async function deleteBucket(id) {
+  try {
+    var res = await fetch(BASE + '/api/bucket/' + id, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({_delete: true}),
+    });
+    closeDetail();
+    loadBuckets();
+  } catch (e) {
+    alert('删除失败: ' + e.message);
   }
 }
 
