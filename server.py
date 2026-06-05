@@ -1347,6 +1347,82 @@ async def api_bucket_detail(request):
     })
 
 
+@mcp.custom_route("/api/bucket/{bucket_id}", methods=["POST"])
+async def api_bucket_update(request):
+    """Update bucket metadata and/or content from dashboard."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    # --- Delete mode ---
+    if body.get("_delete"):
+        success = await bucket_mgr.delete(bucket_id)
+        if success:
+            embedding_engine.delete_embedding(bucket_id)
+            return JSONResponse({"ok": True, "deleted": bucket_id})
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    updates = {}
+    if "name" in body and body["name"]:
+        updates["name"] = body["name"]
+    if "domain" in body:
+        if isinstance(body["domain"], list):
+            updates["domain"] = body["domain"]
+        elif isinstance(body["domain"], str):
+            updates["domain"] = [d.strip() for d in body["domain"].split(",") if d.strip()]
+    if "tags" in body:
+        if isinstance(body["tags"], list):
+            updates["tags"] = body["tags"]
+        elif isinstance(body["tags"], str):
+            updates["tags"] = [t.strip() for t in body["tags"].split(",") if t.strip()]
+    if "valence" in body:
+        v = float(body["valence"])
+        if 0 <= v <= 1:
+            updates["valence"] = v
+    if "arousal" in body:
+        a = float(body["arousal"])
+        if 0 <= a <= 1:
+            updates["arousal"] = a
+    if "importance" in body:
+        imp = int(body["importance"])
+        if 1 <= imp <= 10:
+            updates["importance"] = imp
+    if "resolved" in body:
+        updates["resolved"] = bool(body["resolved"])
+    if "pinned" in body:
+        updates["pinned"] = bool(body["pinned"])
+        if body["pinned"]:
+            updates["importance"] = 10
+    if "digested" in body:
+        updates["digested"] = bool(body["digested"])
+    if "content" in body and body["content"]:
+        updates["content"] = body["content"]
+
+    if not updates:
+        return JSONResponse({"error": "no fields to update"}, status_code=400)
+
+    success = await bucket_mgr.update(bucket_id, **updates)
+    if not success:
+        return JSONResponse({"error": "update failed"}, status_code=500)
+
+    if "content" in updates:
+        try:
+            await embedding_engine.generate_and_store(bucket_id, updates["content"])
+        except Exception:
+            pass
+
+    return JSONResponse({"ok": True, "updated": list(updates.keys())})
+
+
 @mcp.custom_route("/api/search", methods=["GET"])
 async def api_search(request):
     """Search buckets by query."""
@@ -1364,10 +1440,20 @@ async def api_search(request):
             result.append({
                 "id": b["id"],
                 "name": meta.get("name", b["id"]),
-                "score": b.get("score", 0),
+                "type": meta.get("type", "dynamic"),
                 "domain": meta.get("domain", []),
+                "tags": meta.get("tags", []),
                 "valence": meta.get("valence", 0.5),
                 "arousal": meta.get("arousal", 0.3),
+                "model_valence": meta.get("model_valence"),
+                "importance": meta.get("importance", 5),
+                "resolved": meta.get("resolved", False),
+                "pinned": meta.get("pinned", False),
+                "digested": meta.get("digested", False),
+                "created": meta.get("created", ""),
+                "last_active": meta.get("last_active", ""),
+                "activation_count": meta.get("activation_count", 1),
+                "score": b.get("score", 0) or decay_engine.calculate_score(meta),
                 "content_preview": strip_wikilinks(b.get("content", ""))[:200],
             })
         return JSONResponse(result)
