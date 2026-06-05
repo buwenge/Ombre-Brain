@@ -391,6 +391,21 @@ class Dehydrator:
             header += "\n"
         
         content = re.sub(r'\[\[([^\]]+)\]\]', r'\1', content)
+
+        # --- If content is dehydrated JSON, extract only summary + emotion_state ---
+        # --- 如果内容是脱水后的 JSON，只提取 summary 和 emotion_state 返回 ---
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict) and "summary" in parsed:
+                parts = []
+                emotion = parsed.get("emotion_state", "")
+                if emotion:
+                    parts.append(f"【情绪：{emotion}】")
+                parts.append(parsed["summary"])
+                content = "".join(parts)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
         return f"{header}{content}"
 
     # ---------------------------------------------------------
