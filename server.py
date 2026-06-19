@@ -359,6 +359,7 @@ async def breath_hook(request):
             summary_tokens = count_tokens_approx(summary)
             if summary_tokens > token_budget:
                 break
+            await bucket_mgr.soft_touch(b["id"])
             parts.append(summary)
             token_budget -= summary_tokens
 
@@ -679,7 +680,7 @@ async def breath(
                 summary_tokens = count_tokens_approx(summary)
                 if summary_tokens > token_budget:
                     break
-                # NOTE: no touch() here — surfacing should NOT reset decay timer
+                await bucket_mgr.soft_touch(b["id"])
                 score = decay_engine.calculate_score(b["metadata"])
                 dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
                 token_budget -= summary_tokens

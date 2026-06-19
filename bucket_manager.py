@@ -345,6 +345,25 @@ class BucketManager:
         return True
 
     # ---------------------------------------------------------
+    # Soft-touch bucket (increment count only, no last_active reset)
+    # 轻触桶（只加激活次数，不刷新 last_active，不触发涟漪）
+    # Called on surfacing; prevents decay death for frequently seen buckets.
+    # 浮现时调用，防止频繁浮现的桶因无人主动搜索而衰减至死。
+    # ---------------------------------------------------------
+    async def soft_touch(self, bucket_id: str, increment: float = 0.1) -> None:
+        file_path = self._find_bucket_file(bucket_id)
+        if not file_path:
+            return
+        try:
+            post = frontmatter.load(file_path)
+            current = float(post.get("activation_count", 0))
+            post["activation_count"] = round(current + increment, 1)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(frontmatter.dumps(post))
+        except Exception as e:
+            logger.warning(f"Failed to soft-touch bucket / 轻触桶失败: {bucket_id}: {e}")
+
+    # ---------------------------------------------------------
     # Touch bucket (refresh activation time + increment count)
     # 触碰桶（刷新激活时间 + 累加激活次数）
     # Called on every recall hit; affects decay score.

@@ -161,6 +161,8 @@ class DecayEngine:
             resolved_factor = 0.02
         elif resolved:
             resolved_factor = 0.05
+        elif digested:
+            resolved_factor = 0.3
         else:
             resolved_factor = 1.0
         urgency_boost = 1.5 if (arousal > 0.7 and not resolved) else 1.0
