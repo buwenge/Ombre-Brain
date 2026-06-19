@@ -129,8 +129,10 @@ class DecayEngine:
             arousal = 0.3
         emotion_weight = self.emotion_base + arousal * self.arousal_boost
 
-        # --- Time weight ---
-        time_weight = self._calc_time_weight(days_since)
+        # --- Time weight (dampened by activation count) ---
+        # 高激活桶的新鲜度加成递减，防止反复 touch 导致分数暴涨
+        raw_time_weight = self._calc_time_weight(days_since)
+        time_weight = 1.0 + (raw_time_weight - 1.0) / (1.0 + 0.1 * activation_count)
 
         # --- Short-term vs Long-term weight separation ---
         # 短期（≤3天）：time_weight 占 70%，emotion 占 30%
@@ -165,7 +167,12 @@ class DecayEngine:
             resolved_factor = 0.3
         else:
             resolved_factor = 1.0
-        urgency_boost = 1.5 if (arousal > 0.7 and not resolved) else 1.0
+        # urgency_boost 随时间衰减：紧迫感是短期信号
+        # Day 0: 1.5, Day 7: ~1.3, Day 14: ~1.18, Day 30: ~1.06
+        if arousal > 0.7 and not resolved:
+            urgency_boost = 1.0 + 0.5 * math.exp(-days_since / 14.0)
+        else:
+            urgency_boost = 1.0
 
         return round(base_score * resolved_factor * urgency_boost, 4)
 

@@ -575,6 +575,7 @@ async def breath(
             feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
             if not feels:
                 return "没有留下过 feel。"
+            feels = feels[:10]
             results = []
             for f in feels:
                 created = f["metadata"].get("created", "")
