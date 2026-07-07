@@ -58,6 +58,7 @@ class BucketManager:
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
         self.archive_dir = os.path.join(self.base_dir, "archive")
         self.feel_dir = os.path.join(self.base_dir, "feel")
+        self.letter_dir = os.path.join(self.base_dir, "letters")
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
 
@@ -168,10 +169,14 @@ class BucketManager:
                 metadata["type"] = "permanent"
         elif bucket_type == "feel":
             type_dir = self.feel_dir
+        elif bucket_type == "letter":
+            type_dir = self.letter_dir
         else:
             type_dir = self.dynamic_dir
         if bucket_type == "feel":
             primary_domain = "沉淀物"  # feel subfolder name
+        elif bucket_type == "letter":
+            primary_domain = "history"  # letters/history/ subfolder
         else:
             primary_domain = sanitize_name(domain[0]) if domain else "未分类"
         target_dir = os.path.join(type_dir, primary_domain)
@@ -285,6 +290,15 @@ class BucketManager:
             post["digested"] = bool(kwargs["digested"])
         if "model_valence" in kwargs:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
+        # --- letter 元数据字段（署名/称呼/标题/信件日期），原样透传 ---
+        if "author" in kwargs:
+            post["author"] = str(kwargs["author"]).strip()
+        if "user_name" in kwargs:
+            post["user_name"] = str(kwargs["user_name"]).strip()
+        if "title" in kwargs:
+            post["title"] = str(kwargs["title"]).strip()[:120]
+        if "letter_date" in kwargs:
+            post["letter_date"] = str(kwargs["letter_date"]).strip()
 
         # --- Auto-refresh activation time / 自动刷新激活时间 ---
         post["last_active"] = now_iso()
@@ -649,7 +663,7 @@ class BucketManager:
         """
         buckets = []
 
-        dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir]
+        dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir, self.letter_dir]
         if include_archive:
             dirs.append(self.archive_dir)
 
@@ -681,6 +695,7 @@ class BucketManager:
             "dynamic_count": 0,
             "archive_count": 0,
             "feel_count": 0,
+            "letter_count": 0,
             "total_size_kb": 0.0,
             "domains": {},
         }
@@ -690,6 +705,7 @@ class BucketManager:
             (self.dynamic_dir, "dynamic_count"),
             (self.archive_dir, "archive_count"),
             (self.feel_dir, "feel_count"),
+            (self.letter_dir, "letter_count"),
         ]:
             if not os.path.exists(subdir):
                 continue
@@ -763,7 +779,7 @@ class BucketManager:
         """
         if not bucket_id:
             return None
-        for dir_path in [self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir]:
+        for dir_path in [self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir, self.letter_dir]:
             if not os.path.exists(dir_path):
                 continue
             for root, _, files in os.walk(dir_path):

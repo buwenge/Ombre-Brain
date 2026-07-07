@@ -56,7 +56,7 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
+from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, get_ai_name
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -542,7 +542,7 @@ async def breath(
         filtered = [
             b for b in all_buckets
             if int(b["metadata"].get("importance", 0)) >= importance_min
-            and b["metadata"].get("type") not in ("feel",)
+            and b["metadata"].get("type") not in ("feel", "letter")
         ]
         filtered.sort(key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True)
         filtered = filtered[:20]
@@ -618,7 +618,7 @@ async def breath(
         unresolved = [
             b for b in all_buckets
             if not b["metadata"].get("resolved", False)
-            and b["metadata"].get("type") not in ("permanent", "feel")
+            and b["metadata"].get("type") not in ("permanent", "feel", "letter")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
         ]
@@ -1180,10 +1180,10 @@ async def dream() -> str:
         logger.error(f"Dream failed to list buckets: {e}")
         return "记忆系统暂时无法访问。"
 
-    # --- Filter: recent surface-level dynamic buckets (not permanent/pinned/feel) ---
+    # --- Filter: recent surface-level dynamic buckets (not permanent/pinned/feel/letter) ---
     candidates = [
         b for b in all_buckets
-        if b["metadata"].get("type") not in ("permanent", "feel")
+        if b["metadata"].get("type") not in ("permanent", "feel", "letter")
         and not b["metadata"].get("pinned", False)
         and not b["metadata"].get("protected", False)
     ]
@@ -1288,6 +1288,164 @@ async def dream() -> str:
     final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
+
+
+# =============================================================
+# Tool: letter_write — 写信，用户与你之间的永久信件
+# =============================================================
+@mcp.tool()
+async def letter_write(
+    author: str,
+    content: str,
+    user_name: str = "",
+    title: str = "",
+    date: str = "",
+) -> str:
+    """写一封信,永久保存,不参与衰减/合并/普通浮现,只能通过 letter_read 读取。author='user'表示这封信是用户执笔;'ai'或你自己的名字表示你执笔(统一存为 AI_NAME 环境变量配置的署名)。user_name可选,标注用户具体署名。title可选标题。date可选(YYYY-MM-DD,不填用当前时间)。"""
+    await decay_engine.ensure_started()
+    if user_name is None: user_name = ""
+    if title is None: title = ""
+    if date is None: date = ""
+    if not author or not author.strip():
+        return "author 不能为空。"
+    if not content or not content.strip():
+        return "信件内容不能为空。"
+
+    ai_name = get_ai_name()
+    raw = author.strip()
+    low = raw.lower()
+    if low == "user":
+        a = "user"
+    elif low in ("ai", "claude") or raw == ai_name:
+        a = ai_name
+    else:
+        a = raw
+
+    extra_meta = {"author": a}
+    if user_name.strip():
+        extra_meta["user_name"] = user_name.strip()
+    if title.strip():
+        extra_meta["title"] = title.strip()[:120]
+    if date.strip():
+        extra_meta["letter_date"] = date.strip()
+
+    bucket_id = await bucket_mgr.create(
+        content=content.strip(),
+        tags=["__letter__"],
+        importance=10,
+        domain=["letter"],
+        valence=0.5,
+        arousal=0.3,
+        name=(title.strip()[:60] or f"{a}_{date.strip() or 'letter'}"),
+        bucket_type="letter",
+        verbatim=True,
+    )
+    try:
+        await bucket_mgr.update(bucket_id, **extra_meta)
+    except Exception as e:
+        logger.warning(f"letter_write update meta failed / 写信元数据更新失败: {e}")
+    try:
+        await embedding_engine.generate_and_store(bucket_id, content)
+    except Exception:
+        pass
+    return f"💌letter→{bucket_id} [{a}]"
+
+
+# =============================================================
+# Tool: letter_read — 读信
+# =============================================================
+@mcp.tool()
+async def letter_read(
+    query: str = "",
+    limit: int = 10,
+    author: str = "",
+    date_from: str = "",
+    date_to: str = "",
+) -> str:
+    """读信。不传query=按时间倒序返回最近的信;传query=语义/关键词检索。author筛选:'user'/'ai'/具体署名。date_from/date_to按YYYY-MM-DD筛选letter_date或创建时间(闭区间)。limit最多50,默认10。"""
+    if query is None: query = ""
+    if limit is None: limit = 10
+    if author is None: author = ""
+    if date_from is None: date_from = ""
+    if date_to is None: date_to = ""
+    limit = max(1, min(50, limit))
+    try:
+        all_b = await bucket_mgr.list_all(include_archive=False)
+    except Exception as e:
+        return f"读取信件失败: {e}"
+    letters = [b for b in all_b if b["metadata"].get("type") == "letter"]
+
+    af = author.strip()
+    if af:
+        ai_name = get_ai_name()
+        af_low = af.lower()
+        if af_low == "user":
+            letters = [b for b in letters if b["metadata"].get("author") == "user"]
+        elif af_low in ("ai", "claude") or af == ai_name:
+            ai_aliases = {ai_name, "claude"}
+            letters = [b for b in letters if b["metadata"].get("author") in ai_aliases]
+        else:
+            letters = [b for b in letters if b["metadata"].get("author") == af]
+
+    def _within(b):
+        d = b["metadata"].get("letter_date") or b["metadata"].get("created", "")
+        if date_from and d and d < date_from:
+            return False
+        if date_to and d and d > date_to:
+            return False
+        return True
+
+    letters = [b for b in letters if _within(b)]
+
+    query_text = query.strip()
+
+    def _matches_query(b):
+        if not query_text:
+            return True
+        meta = b.get("metadata", {})
+        parts = [
+            b.get("content", ""),
+            str(meta.get("name") or ""),
+            str(meta.get("title") or ""),
+            str(meta.get("author") or ""),
+        ]
+        parts.extend(str(t) for t in (meta.get("tags") or []))
+        return query_text.lower() in "\n".join(parts).lower()
+
+    if query_text and embedding_engine and getattr(embedding_engine, "enabled", False):
+        try:
+            sims = await embedding_engine.search_similar(query_text, top_k=limit * 3)
+            id_score = {bid: sc for bid, sc in sims}
+            vector_matches = [b for b in letters if b["id"] in id_score]
+            if vector_matches:
+                letters = vector_matches
+                letters.sort(key=lambda b: id_score.get(b["id"], 0.0), reverse=True)
+            else:
+                letters = [b for b in letters if _matches_query(b)]
+                letters.sort(key=lambda b: b["metadata"].get("letter_date") or b["metadata"].get("created", ""), reverse=True)
+        except Exception as e:
+            logger.warning(f"letter_read vector search failed / 信件向量检索失败: {e}")
+            letters = [b for b in letters if _matches_query(b)]
+            letters.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+    else:
+        if query_text:
+            letters = [b for b in letters if _matches_query(b)]
+        letters.sort(key=lambda b: b["metadata"].get("letter_date") or b["metadata"].get("created", ""), reverse=True)
+
+    letters = letters[:limit]
+    if not letters:
+        return "没有找到匹配的信件。"
+    parts = []
+    for b in letters:
+        m = b["metadata"]
+        a = m.get("author", "?")
+        d = (m.get("letter_date") or m.get("created", ""))[:10]
+        title = m.get("title") or m.get("name", "")
+        parts.append(
+            f"[{b['id']}] {a} · {d}{(' · ' + title) if title else ''}\n"
+            + strip_wikilinks(b["content"])
+        )
+    return "=== 信件 ===\n" + "\n\n---\n\n".join(parts)
 
 
 # =============================================================

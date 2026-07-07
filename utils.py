@@ -170,6 +170,14 @@ def generate_bucket_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def get_ai_name() -> str:
+    """
+    AI 显示名，读取 AI_NAME 环境变量，未设置时回退 "AI"。
+    用于 letter 署名等面向用户的展示场景。
+    """
+    return os.environ.get("AI_NAME", "").strip() or "AI"
+
+
 def strip_wikilinks(text: str) -> str:
     """
     Remove Obsidian wikilink brackets: [[word]] → word
