@@ -1666,6 +1666,86 @@ async def api_network(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# =============================================================
+# /api/admin/backfill-embeddings — one-off catch-up for buckets
+# that existed before embedding was correctly configured.
+# Writes only to the embeddings SQLite DB via generate_and_store;
+# deliberately does NOT go through bucket_mgr.update(), so it never
+# touches last_active / activation_count on any bucket.
+# =============================================================
+_backfill_state = {
+    "running": False,
+    "total": 0,
+    "done": 0,
+    "success": 0,
+    "failed": 0,
+    "skipped": 0,
+    "finished": False,
+}
+
+
+async def _run_backfill():
+    global _backfill_state
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=True)
+        missing = []
+        for b in all_buckets:
+            emb = await embedding_engine.get_embedding(b["id"])
+            if emb is None:
+                missing.append(b)
+
+        _backfill_state.update({
+            "running": True, "total": len(missing), "done": 0,
+            "success": 0, "failed": 0, "skipped": 0, "finished": False,
+        })
+
+        batch_size = 20
+        for i in range(0, len(missing), batch_size):
+            batch = missing[i:i + batch_size]
+            for b in batch:
+                content = b.get("content", "")
+                if not content or not content.strip():
+                    _backfill_state["skipped"] += 1
+                else:
+                    try:
+                        ok = await embedding_engine.generate_and_store(b["id"], content)
+                        _backfill_state["success" if ok else "failed"] += 1
+                    except Exception as e:
+                        logger.warning(f"Backfill embedding failed for {b['id']}: {e}")
+                        _backfill_state["failed"] += 1
+                _backfill_state["done"] += 1
+            if i + batch_size < len(missing):
+                await asyncio.sleep(2)
+    except Exception as e:
+        logger.error(f"Backfill run failed: {e}")
+    finally:
+        _backfill_state["running"] = False
+        _backfill_state["finished"] = True
+
+
+@mcp.custom_route("/api/admin/backfill-embeddings", methods=["POST"])
+async def api_admin_backfill_embeddings(request):
+    """Start a one-off backfill of missing embeddings for existing buckets."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    if not embedding_engine.enabled:
+        return JSONResponse({"error": "Embedding not enabled"}, status_code=400)
+    if _backfill_state["running"]:
+        return JSONResponse({"error": "Backfill already running"}, status_code=409)
+    asyncio.create_task(_run_backfill())
+    return JSONResponse({"status": "started"})
+
+
+@mcp.custom_route("/api/admin/backfill-embeddings", methods=["GET"])
+async def api_admin_backfill_status(request):
+    """Get progress of the running/last backfill."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    return JSONResponse(_backfill_state)
+
+
 @mcp.custom_route("/api/breath-debug", methods=["GET"])
 async def api_breath_debug(request):
     """Debug endpoint: simulate breath scoring and return per-bucket breakdown."""
