@@ -1813,7 +1813,7 @@ async def api_config_update(request):
             dehy["api_key"] = d["api_key"]
             updated.append("dehydration.api_key")
         # Hot-reload dehydrator
-        dehydrator.model = dehy.get("model", "deepseek-chat")
+        dehydrator.model = dehy.get("model", "deepseek-v4-flash")
         dehydrator.base_url = dehy.get("base_url", "")
         dehydrator.api_key = dehy.get("api_key", "")
         if hasattr(dehydrator, "client") and dehydrator.api_key:

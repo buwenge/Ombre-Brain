@@ -60,7 +60,7 @@ async def reclassify():
         base_url=dehy.get("base_url", "https://api.deepseek.com/v1"),
         timeout=60.0,
     )
-    model_name = dehy.get("model", "deepseek-chat")
+    model_name = dehy.get("model", "deepseek-v4-flash")
 
     files = sorted(glob.glob(os.path.join(UNCLASS_DIR, "*.md")))
     print(f"找到 {len(files)} 个未分类文件\n")
