@@ -118,6 +118,14 @@ def load_config(config_path: str = None) -> dict:
     if env_embed_base_url:
         config.setdefault("embedding", {})["base_url"] = env_embed_base_url
 
+    # OMBRE_EMBEDDING_API_KEY overrides embedding.api_key
+    # Without this, embedding silently reused the dehydration API key/base_url,
+    # which breaks when dehydration points at a different provider than the
+    # embedding model (e.g. DeepSeek key + gemini-embedding-001 model).
+    env_embed_api_key = os.environ.get("OMBRE_EMBEDDING_API_KEY", "")
+    if env_embed_api_key:
+        config.setdefault("embedding", {})["api_key"] = env_embed_api_key
+
     # --- Ensure bucket storage directories exist ---
     # --- 确保记忆桶存储目录存在 ---
     buckets_dir = config["buckets_dir"]

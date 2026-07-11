@@ -15,6 +15,7 @@
 | `OMBRE_MODEL` | 否 | — | `OMBRE_DEHYDRATION_MODEL` 的别名（前者优先） |
 | `OMBRE_EMBEDDING_MODEL` | 否 | `gemini-embedding-001` | 向量嵌入模型名（覆盖 `embedding.model`） |
 | `OMBRE_EMBEDDING_BASE_URL` | 否 | — | 向量嵌入的 API Base URL（覆盖 `embedding.base_url`；留空则复用脱水配置） |
+| `OMBRE_EMBEDDING_API_KEY` | 否 | — | 向量嵌入专用 API Key（覆盖 `embedding.api_key`；留空则复用 `OMBRE_API_KEY`）。**若脱水模型（如 DeepSeek）和向量化模型（如 Gemini）不是同一家，必须单独设置这个，否则向量化会一直用错的 key 调用错的服务商，静默失败** |
 
 ## 说明
 
