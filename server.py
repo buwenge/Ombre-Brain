@@ -728,7 +728,7 @@ async def breath(
         for vid, sim_score in vector_results:
             if vid not in matched_ids and sim_score > 0.5:
                 bucket = await bucket_mgr.get(vid)
-                if bucket:
+                if bucket and bucket["metadata"].get("type") not in ("feel", "letter"):
                     bucket["score"] = round(sim_score * 100, 2)
                     bucket["vector_match"] = True
                     matches.append(bucket)

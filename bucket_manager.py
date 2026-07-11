@@ -492,6 +492,10 @@ class BucketManager:
 
         limit = limit or self.max_results
         all_buckets = await self.list_all(include_archive=False)
+        # feel/letter are dedicated channels (breath(domain="feel") / letter_read),
+        # not reachable via keyword or vector search — same isolation as elsewhere
+        # in server.py (breath surfacing, importance_min pull).
+        all_buckets = [b for b in all_buckets if b["metadata"].get("type") not in ("feel", "letter")]
 
         if not all_buckets:
             return []
