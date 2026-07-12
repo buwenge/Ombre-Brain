@@ -29,6 +29,7 @@ import json
 import hashlib
 import sqlite3
 import logging
+import asyncio
 
 from openai import AsyncOpenAI
 
@@ -120,7 +121,7 @@ MERGE_PROMPT = """你是一个信息合并专家。请将旧记忆与新内容�
 ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出结构化的元数据。
 
 分析规则：
-1. domain（主题域）：选最精确的 1~2 个，只选真正相关的
+1. domain（主题域）：选最精确的 1~2 个，只选真正相关的。此字段禁止省略或留空——如果都不够贴切，也要选最接近的 1 个，不允许因为不确定就不写这个字段
    日常: ["饮食", "穿搭", "出行", "居家", "购物"]
    人际: ["家庭", "恋爱", "友谊", "社交"]
    成长: ["工作", "学习", "考试", "求职"]
@@ -445,32 +446,79 @@ class Dehydrator:
         """
         Call LLM API for content analysis / tagging.
         调用 LLM API 执行内容分析打标。
+
+        Retries up to 3 attempts (increasing backoff) on hard API errors AND
+        on the softer "response parsed fine but domain was omitted" case,
+        since that's the failure mode actually observed in production
+        (model returns valid JSON with good tags/valence/arousal but skips
+        the domain key). Only after 3 attempts does it fall back to 未分类,
+        and that fallback is logged at ERROR level so it isn't silent.
+        重试最多3次(间隔递增)，覆盖硬性 API 报错和"JSON 解析正常但漏了 domain
+        字段"这种软失败(生产环境实际观察到的失败模式：标签/情感值都正常，
+        唯独 domain 被漏填)。3次都拿不到有效 domain 才兜底为"未分类"，
+        且这个兜底会打 ERROR 级日志，不再无声。
         """
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": ANALYZE_PROMPT},
-                {"role": "user", "content": content[:2000]},
-            ],
-            max_tokens=256,
-            temperature=0.1,
+        last_result = None
+        for attempt in range(3):
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": ANALYZE_PROMPT},
+                        {"role": "user", "content": content[:2000]},
+                    ],
+                    max_tokens=256,
+                    temperature=0.1,
+                )
+                raw = (response.choices[0].message.content or "") if response.choices else ""
+            except Exception as e:
+                if attempt < 2:
+                    logger.warning(f"API 打标第{attempt + 1}次调用异常，重试: {e}")
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"API 打标连续3次调用失败: {e}") from e
+
+            if not raw.strip():
+                last_result = self._default_analysis()
+                if attempt < 2:
+                    logger.warning(f"API 打标第{attempt + 1}次尝试返回空内容，重试")
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+
+            result, domain_ok = self._parse_analysis(raw)
+            if domain_ok:
+                return result
+            last_result = result
+            if attempt < 2:
+                logger.warning(
+                    f"API 打标第{attempt + 1}次尝试未返回有效 domain 字段，重试"
+                    f"（原始返回片段: {raw[:150]!r}）"
+                )
+                await asyncio.sleep(1.5 * (attempt + 1))
+
+        logger.error(
+            f"API 打标连续3次均未获得有效 domain 分类，兜底为「未分类」"
+            f"（内容前30字: {content[:30]!r}）"
         )
-        if not response.choices:
-            return self._default_analysis()
-        raw = response.choices[0].message.content or ""
-        if not raw.strip():
-            return self._default_analysis()
-        return self._parse_analysis(raw)
+        return last_result or self._default_analysis()
 
     # ---------------------------------------------------------
     # Parse API JSON response with safety checks
     # 解析 API 返回的 JSON，做安全校验
     # Ensure valence/arousal in 0~1, domain/tags valid
     # ---------------------------------------------------------
-    def _parse_analysis(self, raw: str) -> dict:
+    def _parse_analysis(self, raw: str) -> tuple[dict, bool]:
         """
         Parse and validate API tagging result.
         解析并校验 API 返回的打标结果。
+
+        Returns (result_dict, domain_ok) — domain_ok is False whenever the
+        "domain" key was missing/empty in the model's JSON, so the caller
+        can decide to retry instead of silently accepting a 未分类 result.
+        返回 (结果字典, domain 是否有效) —— domain_ok 为 False 代表模型返回的
+        JSON 里 domain 键缺失或为空，调用方可以据此判断要不要重试，而不是
+        默默接受一个"未分类"的结果。
         """
         try:
             # Handle potential markdown code block wrapping
@@ -481,10 +529,10 @@ class Dehydrator:
             result = json.loads(cleaned)
         except (json.JSONDecodeError, IndexError, ValueError):
             logger.warning(f"API tagging JSON parse failed / JSON 解析失败: {raw[:200]}")
-            return self._default_analysis()
+            return self._default_analysis(), False
 
         if not isinstance(result, dict):
-            return self._default_analysis()
+            return self._default_analysis(), False
 
         # --- Validate and clamp value ranges / 校验并钳制数值范围 ---
         try:
@@ -493,13 +541,16 @@ class Dehydrator:
         except (ValueError, TypeError):
             valence, arousal = 0.5, 0.3
 
+        domain = result.get("domain") or []
+        domain_ok = bool(domain)
+
         return {
-            "domain": result.get("domain", ["未分类"])[:3],
+            "domain": domain[:3] if domain_ok else ["未分类"],
             "valence": valence,
             "arousal": arousal,
             "tags": result.get("tags", [])[:15],
             "suggested_name": str(result.get("suggested_name", ""))[:20],
-        }
+        }, domain_ok
 
     # ---------------------------------------------------------
     # Default analysis result (empty content or total failure)

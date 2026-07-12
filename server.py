@@ -1746,6 +1746,97 @@ async def api_admin_backfill_status(request):
     return JSONResponse(_backfill_state)
 
 
+# =============================================================
+# /api/admin/backfill-tags — one-off re-tagging for buckets that got
+# stuck with domain=["未分类"] because deepseek-v4-flash intermittently
+# omits the domain key (see dehydrator._api_analyze retry logic above).
+# Writes only domain/tags/valence/arousal/name via bucket_mgr.update(),
+# always with touch=False so the decay clock is not reset.
+# =============================================================
+_tag_backfill_state = {
+    "running": False,
+    "total": 0,
+    "done": 0,
+    "fixed": 0,
+    "still_unclassified": 0,
+    "skipped": 0,
+    "finished": False,
+}
+
+
+async def _run_tag_backfill():
+    global _tag_backfill_state
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=True)
+        targets = [
+            b for b in all_buckets
+            if b.get("metadata", {}).get("domain") == ["未分类"]
+            and b.get("metadata", {}).get("type") not in ("feel", "letter")
+        ]
+
+        _tag_backfill_state.update({
+            "running": True, "total": len(targets), "done": 0,
+            "fixed": 0, "still_unclassified": 0, "skipped": 0, "finished": False,
+        })
+
+        for b in targets:
+            content = b.get("content", "")
+            if not content or not content.strip():
+                _tag_backfill_state["skipped"] += 1
+                _tag_backfill_state["done"] += 1
+                continue
+            try:
+                analysis = await dehydrator.analyze(content)
+            except Exception as e:
+                logger.warning(f"Tag backfill analyze failed for {b['id']}: {e}")
+                _tag_backfill_state["still_unclassified"] += 1
+                _tag_backfill_state["done"] += 1
+                continue
+
+            if analysis.get("domain") == ["未分类"]:
+                _tag_backfill_state["still_unclassified"] += 1
+            else:
+                update_kwargs = {
+                    "domain": analysis["domain"],
+                    "tags": analysis.get("tags", []),
+                    "valence": analysis.get("valence", 0.5),
+                    "arousal": analysis.get("arousal", 0.3),
+                }
+                meta_name = b.get("metadata", {}).get("name", "")
+                if (not meta_name or meta_name == b["id"]) and analysis.get("suggested_name"):
+                    update_kwargs["name"] = analysis["suggested_name"]
+                await bucket_mgr.update(b["id"], touch=False, **update_kwargs)
+                _tag_backfill_state["fixed"] += 1
+            _tag_backfill_state["done"] += 1
+            await asyncio.sleep(0.5)
+    except Exception as e:
+        logger.error(f"Tag backfill run failed: {e}")
+    finally:
+        _tag_backfill_state["running"] = False
+        _tag_backfill_state["finished"] = True
+
+
+@mcp.custom_route("/api/admin/backfill-tags", methods=["POST"])
+async def api_admin_backfill_tags(request):
+    """Start a one-off re-tagging pass for buckets stuck at domain=未分类."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    if _tag_backfill_state["running"]:
+        return JSONResponse({"error": "Tag backfill already running"}, status_code=409)
+    asyncio.create_task(_run_tag_backfill())
+    return JSONResponse({"status": "started"})
+
+
+@mcp.custom_route("/api/admin/backfill-tags", methods=["GET"])
+async def api_admin_backfill_tags_status(request):
+    """Get progress of the running/last tag backfill."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    return JSONResponse(_tag_backfill_state)
+
+
 @mcp.custom_route("/api/breath-debug", methods=["GET"])
 async def api_breath_debug(request):
     """Debug endpoint: simulate breath scoring and return per-bucket breakdown."""

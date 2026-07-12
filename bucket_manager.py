@@ -244,10 +244,15 @@ class BucketManager:
     # 更新桶
     # Supports: content, tags, importance, valence, arousal, name, resolved
     # ---------------------------------------------------------
-    async def update(self, bucket_id: str, **kwargs) -> bool:
+    async def update(self, bucket_id: str, touch: bool = True, **kwargs) -> bool:
         """
         Update bucket content or metadata fields.
         更新桶的内容或元数据字段。
+
+        touch=False skips the last_active refresh below — for maintenance
+        writes (e.g. re-tagging backfill) that must not reset the decay clock.
+        touch=False 跳过下面的 last_active 刷新——给"补标"这类维护性写入用，
+        不能顺带把衰减时钟清零。
         """
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
@@ -301,7 +306,8 @@ class BucketManager:
             post["letter_date"] = str(kwargs["letter_date"]).strip()
 
         # --- Auto-refresh activation time / 自动刷新激活时间 ---
-        post["last_active"] = now_iso()
+        if touch:
+            post["last_active"] = now_iso()
 
         try:
             with open(file_path, "w", encoding="utf-8") as f:
