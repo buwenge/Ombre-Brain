@@ -1837,6 +1837,16 @@ async def api_admin_backfill_tags_status(request):
     return JSONResponse(_tag_backfill_state)
 
 
+@mcp.custom_route("/api/admin/tagging-diagnostics", methods=["GET"])
+async def api_admin_tagging_diagnostics(request):
+    """Recent auto-tagging failures (raw LLM response + finish_reason per
+    attempt), visible from the Dashboard without needing Zeabur log access."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    return JSONResponse(list(dehydrator.recent_tagging_failures))
+
+
 @mcp.custom_route("/api/breath-debug", methods=["GET"])
 async def api_breath_debug(request):
     """Debug endpoint: simulate breath scoring and return per-bucket breakdown."""

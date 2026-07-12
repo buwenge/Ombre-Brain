@@ -30,10 +30,11 @@ import hashlib
 import sqlite3
 import logging
 import asyncio
+from collections import deque
 
 from openai import AsyncOpenAI
 
-from utils import count_tokens_approx
+from utils import count_tokens_approx, now_iso
 
 logger = logging.getLogger("ombre_brain.dehydrator")
 
@@ -184,6 +185,13 @@ class Dehydrator:
             )
         else:
             self.client = None
+
+        # --- Recent tagging-failure diagnostics (ring buffer, in-memory) ---
+        # --- 最近的打标失败诊断信息（内存环形缓冲）---
+        # Surfaced via /api/admin/tagging-diagnostics so it's visible from
+        # the Dashboard even without Zeabur server-log access.
+        # 通过 /api/admin/tagging-diagnostics 暴露，不需要 Zeabur 后台权限也能看。
+        self.recent_tagging_failures = deque(maxlen=20)
 
         # --- SQLite dehydration cache ---
         # --- SQLite 脱水缓存：content hash → summary ---
@@ -459,6 +467,7 @@ class Dehydrator:
         且这个兜底会打 ERROR 级日志，不再无声。
         """
         last_result = None
+        attempt_log = []  # diagnostic trail for this call, only kept on final failure
         for attempt in range(3):
             try:
                 response = await self.client.chat.completions.create(
@@ -470,18 +479,22 @@ class Dehydrator:
                     max_tokens=256,
                     temperature=0.1,
                 )
+                finish_reason = response.choices[0].finish_reason if response.choices else None
                 raw = (response.choices[0].message.content or "") if response.choices else ""
             except Exception as e:
+                attempt_log.append({"attempt": attempt + 1, "error": str(e)})
                 if attempt < 2:
                     logger.warning(f"API 打标第{attempt + 1}次调用异常，重试: {e}")
                     await asyncio.sleep(1.5 * (attempt + 1))
                     continue
+                self._record_tagging_failure(content, attempt_log)
                 raise RuntimeError(f"API 打标连续3次调用失败: {e}") from e
 
             if not raw.strip():
                 last_result = self._default_analysis()
+                attempt_log.append({"attempt": attempt + 1, "finish_reason": finish_reason, "raw": ""})
                 if attempt < 2:
-                    logger.warning(f"API 打标第{attempt + 1}次尝试返回空内容，重试")
+                    logger.warning(f"API 打标第{attempt + 1}次尝试返回空内容（finish_reason={finish_reason}），重试")
                     await asyncio.sleep(1.5 * (attempt + 1))
                     continue
                 break
@@ -490,6 +503,7 @@ class Dehydrator:
             if domain_ok:
                 return result
             last_result = result
+            attempt_log.append({"attempt": attempt + 1, "finish_reason": finish_reason, "raw": raw[:300]})
             if attempt < 2:
                 logger.warning(
                     f"API 打标第{attempt + 1}次尝试未返回有效 domain 字段，重试"
@@ -501,7 +515,16 @@ class Dehydrator:
             f"API 打标连续3次均未获得有效 domain 分类，兜底为「未分类」"
             f"（内容前30字: {content[:30]!r}）"
         )
+        self._record_tagging_failure(content, attempt_log)
         return last_result or self._default_analysis()
+
+    def _record_tagging_failure(self, content: str, attempt_log: list):
+        """Append a diagnostic record to the in-memory ring buffer / 记一条诊断记录到内存环形缓冲。"""
+        self.recent_tagging_failures.append({
+            "timestamp": now_iso(),
+            "content_preview": content[:80],
+            "attempts": attempt_log,
+        })
 
     # ---------------------------------------------------------
     # Parse API JSON response with safety checks
