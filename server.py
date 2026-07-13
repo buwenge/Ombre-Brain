@@ -306,6 +306,10 @@ async def root_redirect(request):
 async def health_check(request):
     from starlette.responses import JSONResponse
     try:
+        # The engine is intentionally lazy-started because FastMCP owns the
+        # application event loop.  /health is pinged shortly after startup and
+        # every 60 seconds, so it is also our reliable post-redeploy bootstrap.
+        await decay_engine.ensure_started()
         stats = await bucket_mgr.get_stats()
         return JSONResponse({
             "status": "ok",
@@ -1119,6 +1123,9 @@ async def trace(
 @mcp.tool()
 async def pulse(include_archive: bool = False) -> str:
     """系统状态+记忆桶列表。include_archive=True含归档。"""
+    # pulse is often the first tool called after a deployment.  Start the lazy
+    # background task before reporting status so "stopped" is not a false alarm.
+    await decay_engine.ensure_started()
     try:
         stats = await bucket_mgr.get_stats()
     except Exception as e:
