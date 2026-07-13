@@ -139,8 +139,9 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
    两步合并为一个 tags 数组，总计 10~15 个
 5. suggested_name（建议桶名）：10字以内的简短标题
 6. 在 tags 和 suggested_name 中不要使用 [[]] 双链标记
+7. 输出必须是紧凑单行 JSON，不要换行、不要缩进、不要多余空格
 
-输出格式（纯 JSON，无其他内容）：
+输出格式（纯 JSON，无其他内容，单行紧凑）：
 {
   "domain": ["主题域1", "主题域2"],
   "valence": 0.7,
@@ -476,7 +477,7 @@ class Dehydrator:
                         {"role": "system", "content": ANALYZE_PROMPT},
                         {"role": "user", "content": content[:2000]},
                     ],
-                    max_tokens=256,
+                    max_tokens=768,
                     temperature=0.1,
                 )
                 finish_reason = response.choices[0].finish_reason if response.choices else None
