@@ -20,8 +20,8 @@
 #                日记归档，自动拆分多桶
 #       trace  — Modify metadata / resolved / delete
 #                修改元数据 / resolved 标记 / 删除
-#       pulse  — System status + bucket listing
-#                系统状态 + 所有桶列表
+#       pulse  — Compact system health summary (hard-capped)
+#                紧凑系统体检（硬限制输出）
 #       dream  — Surface recent dynamic buckets for self-digestion
 #                返回最近桶 供模型自省/写 feel
 #
@@ -43,6 +43,7 @@ import secrets
 import time
 import json as _json_lib
 import httpx
+from datetime import datetime
 
 
 # --- Ensure same-directory modules can be imported ---
@@ -1117,72 +1118,180 @@ async def trace(
 
 
 # =============================================================
-# Tool 5: pulse — Heartbeat, system status + memory listing
-# 工具 5：pulse — 脉搏，系统状态 + 记忆列表
+# Tool 5: pulse — Heartbeat, compact system health summary
+# 工具 5：pulse — 脉搏，紧凑系统体检
 # =============================================================
+PULSE_MAX_TOKENS = 500
+PULSE_MAX_ANOMALIES = 3
+
+
+def _cap_pulse_output(text: str, max_tokens: int = PULSE_MAX_TOKENS) -> str:
+    """Hard-stop pulse output before it can flood the model context."""
+    if count_tokens_approx(text) <= max_tokens:
+        return text
+
+    suffix = "\n[输出已截断]"
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        candidate = text[:mid].rstrip() + suffix
+        if count_tokens_approx(candidate) <= max_tokens:
+            low = mid
+        else:
+            high = mid - 1
+    return text[:low].rstrip() + suffix
+
+
+async def _collect_diagnostics(include_archive: bool = True) -> dict:
+    """Collect read-only health data shared by pulse and the admin CLI API."""
+    buckets = await bucket_mgr.list_all(include_archive=include_archive)
+    today = datetime.now().date().isoformat()
+    active = [
+        b for b in buckets
+        if b.get("metadata", {}).get("type") != "archived"
+    ]
+
+    type_counts = {
+        "dynamic": 0,
+        "permanent": 0,
+        "feel": 0,
+        "letter": 0,
+        "archived": 0,
+    }
+    today_added = 0
+    undigested = 0
+    unclassified_ids = []
+    invalid_created_ids = []
+
+    for bucket in buckets:
+        meta = bucket.get("metadata", {})
+        btype = meta.get("type", "dynamic")
+        type_counts[btype] = type_counts.get(btype, 0) + 1
+        created = str(meta.get("created", ""))
+        if created[:10] == today:
+            today_added += 1
+        elif created:
+            try:
+                datetime.fromisoformat(created)
+            except (TypeError, ValueError):
+                invalid_created_ids.append(bucket["id"])
+
+        if (
+            btype == "dynamic"
+            and not meta.get("digested", False)
+            and not meta.get("pinned", False)
+            and not meta.get("protected", False)
+        ):
+            undigested += 1
+        if (
+            btype not in ("feel", "letter", "archived")
+            and (not meta.get("domain") or meta.get("domain") == ["未分类"])
+        ):
+            unclassified_ids.append(bucket["id"])
+
+    tagging_failure_count = len(dehydrator.recent_tagging_failures)
+    disk_ids = {
+        b["id"] for b in buckets
+        if str(b.get("content") or "").strip()
+    }
+    index_ids = set()
+    missing_embedding_ids = []
+    orphan_embedding_ids = []
+    if embedding_engine and embedding_engine.enabled:
+        try:
+            index_ids = embedding_engine.list_all_ids()
+            missing_embedding_ids = sorted(disk_ids - index_ids)
+            orphan_embedding_ids = sorted(index_ids - disk_ids)
+        except Exception as e:
+            logger.warning(f"Diagnostics embedding check failed: {e}")
+
+    anomalies = []
+    if tagging_failure_count:
+        anomalies.append({
+            "code": "tagging_failures",
+            "count": tagging_failure_count,
+            "message": f"本次部署记录到 {tagging_failure_count} 次打标失败",
+            "sample_ids": [],
+        })
+    if unclassified_ids:
+        anomalies.append({
+            "code": "unclassified",
+            "count": len(unclassified_ids),
+            "message": f"{len(unclassified_ids)} 个桶仍未分类",
+            "sample_ids": unclassified_ids[:10],
+        })
+    if missing_embedding_ids:
+        anomalies.append({
+            "code": "missing_embeddings",
+            "count": len(missing_embedding_ids),
+            "message": f"{len(missing_embedding_ids)} 个桶缺少向量索引",
+            "sample_ids": missing_embedding_ids[:10],
+        })
+    if orphan_embedding_ids:
+        anomalies.append({
+            "code": "orphan_embeddings",
+            "count": len(orphan_embedding_ids),
+            "message": f"{len(orphan_embedding_ids)} 条向量索引没有对应桶",
+            "sample_ids": orphan_embedding_ids[:10],
+        })
+    if invalid_created_ids:
+        anomalies.append({
+            "code": "invalid_created",
+            "count": len(invalid_created_ids),
+            "message": f"{len(invalid_created_ids)} 个桶的创建时间无效",
+            "sample_ids": invalid_created_ids[:10],
+        })
+    if not decay_engine.is_running:
+        anomalies.insert(0, {
+            "code": "decay_stopped",
+            "count": 1,
+            "message": "衰减引擎未运行",
+            "sample_ids": [],
+        })
+
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "summary": {
+            "total_buckets": len(buckets),
+            "active_buckets": len(active),
+            "today_added": today_added,
+            "undigested": undigested,
+            "feel_count": type_counts.get("feel", 0),
+            "tagging_failure_count": tagging_failure_count,
+            "decay_engine": "running" if decay_engine.is_running else "stopped",
+            "embedding_enabled": bool(embedding_engine and embedding_engine.enabled),
+            "types": type_counts,
+        },
+        "anomalies": anomalies,
+        "buckets": buckets,
+        "index_ids": index_ids,
+    }
+
+
 @mcp.tool()
 async def pulse(include_archive: bool = False) -> str:
-    """系统状态+记忆桶列表。include_archive=True含归档。"""
+    """500 token以内的系统体检摘要；不返回桶清单或正文。include_archive仅为旧客户端兼容保留。"""
     # pulse is often the first tool called after a deployment.  Start the lazy
     # background task before reporting status so "stopped" is not a false alarm.
     await decay_engine.ensure_started()
     try:
-        stats = await bucket_mgr.get_stats()
+        diagnostics = await _collect_diagnostics(include_archive=True)
     except Exception as e:
-        return f"获取系统状态失败: {e}"
+        return _cap_pulse_output(f"Ombre Brain 体检失败: {type(e).__name__}")
 
-    status = (
-        f"=== Ombre Brain 记忆系统 ===\n"
-        f"固化记忆桶: {stats['permanent_count']} 个\n"
-        f"动态记忆桶: {stats['dynamic_count']} 个\n"
-        f"归档记忆桶: {stats['archive_count']} 个\n"
-        f"总存储大小: {stats['total_size_kb']:.1f} KB\n"
-        f"衰减引擎: {'运行中' if decay_engine.is_running else '已停止'}\n"
+    summary = diagnostics["summary"]
+    anomalies = diagnostics["anomalies"][:PULSE_MAX_ANOMALIES]
+    anomaly_lines = [f"- {item['message']}" for item in anomalies] or ["- 无"]
+    result = (
+        "=== Ombre Brain 简短体检 ===\n"
+        f"总桶数: {summary['total_buckets']}\n"
+        f"今日新增: {summary['today_added']}\n"
+        f"未消化/feel数: {summary['undigested']}/{summary['feel_count']}\n"
+        f"打标失败计数: {summary['tagging_failure_count']}\n"
+        "异常摘要（最多3条）:\n"
+        + "\n".join(anomaly_lines)
     )
-
-    # --- List all bucket summaries / 列出所有桶摘要 ---
-    try:
-        buckets = await bucket_mgr.list_all(include_archive=include_archive)
-    except Exception as e:
-        return status + f"\n列出记忆桶失败: {e}"
-
-    if not buckets:
-        return status + "\n记忆库为空。"
-
-    lines = []
-    for b in buckets:
-        meta = b.get("metadata", {})
-        if meta.get("pinned") or meta.get("protected"):
-            icon = "📌"
-        elif meta.get("type") == "permanent":
-            icon = "📦"
-        elif meta.get("type") == "feel":
-            icon = "🫧"
-        elif meta.get("type") == "archived":
-            icon = "🗄️"
-        elif meta.get("resolved", False):
-            icon = "✅"
-        else:
-            icon = "💭"
-        try:
-            score = decay_engine.calculate_score(meta)
-        except Exception:
-            score = 0.0
-        domains = ",".join(meta.get("domain", []))
-        val = meta.get("valence", 0.5)
-        aro = meta.get("arousal", 0.3)
-        resolved_tag = " [已解决]" if meta.get("resolved", False) else ""
-        lines.append(
-            f"{icon} [{meta.get('name', b['id'])}]{resolved_tag} "
-            f"bucket_id:{b['id']} "
-            f"主题:{domains} "
-            f"情感:V{val:.1f}/A{aro:.1f} "
-            f"重要:{meta.get('importance', '?')} "
-            f"权重:{score:.2f} "
-            f"标签:{','.join(meta.get('tags', []))}"
-        )
-
-    return status + "\n=== 记忆列表 ===\n" + "\n".join(lines)
+    return _cap_pulse_output(result)
 
 
 # =============================================================
@@ -1870,6 +1979,69 @@ async def api_admin_tagging_diagnostics(request):
     err = _require_auth(request)
     if err: return err
     return JSONResponse(list(dehydrator.recent_tagging_failures))
+
+
+@mcp.custom_route("/api/admin/diagnostics", methods=["GET"])
+async def api_admin_diagnostics(request):
+    """Read-only, authenticated diagnostics for the maintainer CLI.
+
+    This route is deliberately not an MCP tool and has no Dashboard control.
+    It returns metadata only, never bucket content.
+    """
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+
+    def bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(request.query_params.get(name, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, min(maximum, value))
+
+    include_archive = str(
+        request.query_params.get("include_archive", "true")
+    ).lower() not in ("0", "false", "no")
+    offset = bounded_int("offset", 0, 0, 1_000_000)
+    limit = bounded_int("limit", 25, 1, 100)
+
+    try:
+        diagnostics = await _collect_diagnostics(include_archive=include_archive)
+        buckets = diagnostics.pop("buckets")
+        index_ids = diagnostics.pop("index_ids")
+        buckets.sort(
+            key=lambda b: str(b.get("metadata", {}).get("created", "")),
+            reverse=True,
+        )
+        page = []
+        for bucket in buckets[offset:offset + limit]:
+            meta = bucket.get("metadata", {})
+            page.append({
+                "id": bucket["id"],
+                "name": meta.get("name", bucket["id"]),
+                "type": meta.get("type", "dynamic"),
+                "created": meta.get("created", ""),
+                "last_active": meta.get("last_active", ""),
+                "domain": meta.get("domain", []),
+                "tag_count": len(meta.get("tags", []) or []),
+                "importance": meta.get("importance", 5),
+                "resolved": bool(meta.get("resolved", False)),
+                "digested": bool(meta.get("digested", False)),
+                "score": decay_engine.calculate_score(meta),
+                "has_embedding": bucket["id"] in index_ids if embedding_engine.enabled else None,
+            })
+        diagnostics["pagination"] = {
+            "offset": offset,
+            "limit": limit,
+            "returned": len(page),
+            "total": len(buckets),
+            "include_archive": include_archive,
+        }
+        diagnostics["buckets"] = page
+        return JSONResponse(diagnostics)
+    except Exception as e:
+        logger.exception("Admin diagnostics failed")
+        return JSONResponse({"error": type(e).__name__}, status_code=500)
 
 
 @mcp.custom_route("/api/breath-debug", methods=["GET"])

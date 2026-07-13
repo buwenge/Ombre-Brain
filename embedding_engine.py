@@ -139,6 +139,15 @@ class EmbeddingEngine:
                 return None
         return None
 
+    def list_all_ids(self) -> set[str]:
+        """Return all indexed bucket IDs without loading vector payloads."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute("SELECT bucket_id FROM embeddings").fetchall()
+            return {row[0] for row in rows}
+        finally:
+            conn.close()
+
     async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
         """
         Search for buckets similar to query text.
