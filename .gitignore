@@ -19,3 +19,6 @@ data/
 tests/integration/
 tests/regression/
 tests/unit/
+
+# Local work journal — contains personal relationship content, repo is public
+CLAUDE.md
