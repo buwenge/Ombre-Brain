@@ -800,6 +800,23 @@ async def breath(
     return final_text
 
 
+def _tagging_truncation_note(content: str) -> str:
+    """
+    Non-blocking warning appended to hold/grow's return string when content
+    exceeds the tagging call's input limit — content is stored in full either
+    way, this only means domain/tags may not reflect anything past that cut.
+    Storage never blocks on this: re-entering content to "fix" tags isn't
+    worth the friction, the caller just needs to know it happened.
+    非阻断式提醒——超过打标输入上限时附加在 hold/grow 返回值里。内容本身
+    完整存储，只是标签/分类可能没覆盖到截断点之后的部分。不会因此拒绝存储
+    (重新录入去"修"标签不值得这个摩擦成本)，只是让调用方知道发生过这事。
+    """
+    limit = Dehydrator.ANALYZE_INPUT_LIMIT
+    if len(content) > limit:
+        return f"\n⚠️内容{len(content)}字，超过打标上限{limit}字，标签/分类只覆盖前{limit}字（内容已完整存储，未截断）"
+    return ""
+
+
 # =============================================================
 # Tool 2: hold — Hold on to this
 # 工具 2：hold — 握住，留下来
@@ -899,7 +916,7 @@ async def hold(
             await embedding_engine.generate_and_store(bucket_id, content)
         except Exception:
             pass
-        return f"📌钉选→{bucket_id} {','.join(domain)}"
+        return f"📌钉选→{bucket_id} {','.join(domain)}{_tagging_truncation_note(content)}"
 
     # --- Step 2: merge or create / 合并或新建 ---
     result_name, is_merged = await _merge_or_create(
@@ -914,7 +931,7 @@ async def hold(
     )
 
     action = "合并→" if is_merged else "新建→"
-    return f"{action}{result_name} {','.join(domain)}"
+    return f"{action}{result_name} {','.join(domain)}{_tagging_truncation_note(content)}"
 
 
 # =============================================================
@@ -984,11 +1001,12 @@ async def grow(content: str) -> str:
                 name=item.get("name", ""),
             )
 
+            trunc_mark = "⚠️打标截断" if item.get("tagging_truncated") else ""
             if is_merged:
-                results.append(f"📎{result_name}")
+                results.append(f"📎{result_name}{trunc_mark}")
                 merged += 1
             else:
-                results.append(f"📝{item.get('name', result_name)}")
+                results.append(f"📝{item.get('name', result_name)}{trunc_mark}")
                 created += 1
         except Exception as e:
             logger.warning(

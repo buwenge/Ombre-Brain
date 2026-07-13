@@ -164,6 +164,17 @@ class Dehydrator:
     （根据 BEHAVIOR_SPEC.md 三、降级行为表决策：无本地降级）
     """
 
+    # --- Max chars of bucket content actually sent to the tagging call ---
+    # --- 打标调用实际会发给 AI 的桶内容上限（字符数）---
+    # Content longer than this gets truncated before analysis — tags/domain
+    # will only reflect the first ANALYZE_INPUT_LIMIT chars. Callers (see
+    # server.py hold()/grow()) compare against this to warn the caller
+    # instead of silently mis-tagging the tail of long entries.
+    # 超过这个长度的内容，打标只会看到前面这部分——tags/domain 可能不
+    # 覆盖后面的内容。调用方（server.py 的 hold()/grow()）用这个常量判断
+    # 是否要提醒调用者，而不是让超长内容默默打不准标。
+    ANALYZE_INPUT_LIMIT = 6000
+
     def __init__(self, config: dict):
         # --- Read dehydration API config / 读取脱水 API 配置 ---
         dehy_cfg = config.get("dehydration", {})
@@ -475,7 +486,7 @@ class Dehydrator:
                     model=self.model,
                     messages=[
                         {"role": "system", "content": ANALYZE_PROMPT},
-                        {"role": "user", "content": content[:2000]},
+                        {"role": "user", "content": content[:self.ANALYZE_INPUT_LIMIT]},
                     ],
                     max_tokens=768,
                     temperature=0.1,
@@ -623,6 +634,7 @@ class Dehydrator:
                 "arousal": analysis.get("arousal", 0.3),
                 "tags": analysis.get("tags", []),
                 "importance": 5,
+                "tagging_truncated": len(chunk) > self.ANALYZE_INPUT_LIMIT,
             })
         return items
     # ---------------------------------------------------------
