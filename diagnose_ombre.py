@@ -30,6 +30,11 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=25)
     parser.add_argument("--no-archive", action="store_true")
     parser.add_argument("--buckets", action="store_true", help="print the metadata page")
+    parser.add_argument(
+        "--surface-audit",
+        action="store_true",
+        help="read recent Breath/Dream/Feel selection audit instead",
+    )
     parser.add_argument("--json", action="store_true", help="print raw JSON")
     args = parser.parse_args()
 
@@ -49,17 +54,22 @@ def main() -> int:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    query = urllib.parse.urlencode({
-        "offset": max(0, args.offset),
-        "limit": max(1, min(100, args.limit)),
-        "include_archive": "false" if args.no_archive else "true",
-    })
+    if args.surface_audit:
+        endpoint = "/api/admin/surface-audit"
+        query = urllib.parse.urlencode({"limit": max(1, min(50, args.limit))})
+    else:
+        endpoint = "/api/admin/diagnostics"
+        query = urllib.parse.urlencode({
+            "offset": max(0, args.offset),
+            "limit": max(1, min(100, args.limit)),
+            "include_archive": "false" if args.no_archive else "true",
+        })
 
     try:
         _request_json(opener, login)
         data = _request_json(
             opener,
-            urllib.request.Request(base_url + "/api/admin/diagnostics?" + query),
+            urllib.request.Request(base_url + endpoint + "?" + query),
         )
     except urllib.error.HTTPError as exc:
         print(f"HTTP {exc.code}: diagnostic request failed", file=sys.stderr)
@@ -70,6 +80,25 @@ def main() -> int:
 
     if args.json:
         print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.surface_audit:
+        for event in data.get("events", []):
+            print(
+                f"[{event.get('timestamp', '')}] {event.get('flow', '')} "
+                f"returned={event.get('returned_count', 0)} "
+                f"candidates={event.get('candidate_count', 0)}"
+            )
+            for entry in event.get("entries", []):
+                print(
+                    f"  {entry.get('outcome', ''):26} "
+                    f"weight_rank={entry.get('weight_rank', '-')} "
+                    f"breath_rank={entry.get('breath_rank', '-')} "
+                    f"newest={entry.get('newest_position', '-')} "
+                    f"output={entry.get('output_position', '-')} "
+                    f"cold={entry.get('cold_start', False)} "
+                    f"{entry.get('id', '')} {entry.get('name', '')}"
+                )
         return 0
 
     summary = data["summary"]

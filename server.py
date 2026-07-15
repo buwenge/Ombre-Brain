@@ -57,6 +57,7 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
+from surface_audit import SurfaceAuditLog
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, get_ai_name
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -106,6 +107,7 @@ bucket_mgr.set_activation_callback(
     lambda _bucket_id, mode: decay_engine.relationship_clock.resume(f"bucket_{mode}")
 )
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
+surface_audit = SurfaceAuditLog(config["buckets_dir"], max_events=50)
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -351,13 +353,63 @@ def _select_dream_recent(all_buckets: list[dict], limit: int = DREAM_RECENT_LIMI
     return candidates[:limit]
 
 
+def _weight_rank_snapshot(all_buckets: list[dict]) -> tuple[list[dict], dict[str, int], dict[str, float]]:
+    """Snapshot Breath's pre-reservation unresolved ranking without touching buckets."""
+    eligible = [
+        b for b in all_buckets
+        if not b["metadata"].get("resolved", False)
+        and b["metadata"].get("type") not in ("permanent", "feel", "letter")
+        and not b["metadata"].get("pinned", False)
+        and not b["metadata"].get("protected", False)
+    ]
+    scores = {
+        b["id"]: float(decay_engine.calculate_score(b["metadata"]))
+        for b in eligible
+    }
+    ranked = sorted(eligible, key=lambda b: scores[b["id"]], reverse=True)
+    ranks = {b["id"]: index for index, b in enumerate(ranked, start=1)}
+    return ranked, ranks, scores
+
+
+def _audit_bucket_entry(bucket: dict, **fields) -> dict:
+    meta = bucket.get("metadata", {})
+    return {
+        "id": bucket.get("id", ""),
+        "name": meta.get("name", bucket.get("id", "")),
+        "type": meta.get("type", "dynamic"),
+        "created": meta.get("created", ""),
+        **fields,
+    }
+
+
+def _record_surface_audit(flow: str, entries: list[dict], **context) -> None:
+    """Audit failures are diagnostic-only and must never break memory recall."""
+    try:
+        surface_audit.record(flow, entries, **context)
+    except Exception as exc:
+        logger.warning("Surface audit write failed (%s): %s", flow, type(exc).__name__)
+
+
 @mcp.custom_route("/breath-hook", methods=["GET"])
 async def breath_hook(request):
     from starlette.responses import PlainTextResponse
     try:
         decay_engine.relationship_clock.resume("breath_hook")
         all_buckets = await bucket_mgr.list_all(include_archive=False)
-        dream_ids = {b["id"] for b in _select_dream_recent(all_buckets)}
+        _ranked_all, weight_ranks, score_snapshot = _weight_rank_snapshot(all_buckets)
+        dream_recent = _select_dream_recent(all_buckets)
+        dream_ids = {b["id"] for b in dream_recent}
+        audit_entries = [
+            _audit_bucket_entry(
+                b,
+                channel="dream_reserved",
+                score=score_snapshot.get(b["id"]),
+                weight_rank=weight_ranks.get(b["id"]),
+                newest_position=index,
+                outcome="reserved_for_dream",
+            )
+            for index, b in enumerate(dream_recent, start=1)
+        ]
         # pinned
         pinned = [b for b in all_buckets if b["metadata"].get("pinned") or b["metadata"].get("protected")]
         # unresolved by score, excluding the newest memories reserved for dream
@@ -368,13 +420,22 @@ async def breath_hook(request):
                       and not b["metadata"].get("protected")
                       and b["id"] not in dream_ids]
         scored = sorted(unresolved, key=lambda b: decay_engine.calculate_score(b["metadata"]), reverse=True)
+        breath_ranks = {b["id"]: index for index, b in enumerate(scored, start=1)}
 
         parts = []
         token_budget = 10000
         for b in pinned:
+            entry = _audit_bucket_entry(b, channel="pin", outcome="selected")
             summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
+            summary_tokens = count_tokens_approx(summary)
             parts.append(f"📌 [核心准则] {summary}")
-            token_budget -= count_tokens_approx(summary)
+            token_budget -= summary_tokens
+            entry.update(
+                outcome="surfaced",
+                output_position=len(parts),
+                summary_tokens=summary_tokens,
+            )
+            audit_entries.append(entry)
 
         # Diversity: top-1 fixed + shuffle rest from top-20
         candidates = list(scored)
@@ -386,16 +447,69 @@ async def breath_hook(request):
         # Hard cap: max 20 surfacing buckets in hook
         candidates = candidates[:20]
 
-        for b in candidates:
+        candidate_entries = []
+        for index, b in enumerate(candidates, start=1):
+            candidate_entries.append(_audit_bucket_entry(
+                b,
+                channel="dynamic",
+                score=score_snapshot.get(b["id"]),
+                weight_rank=weight_ranks.get(b["id"]),
+                breath_rank=breath_ranks.get(b["id"]),
+                candidate_position=index,
+                cold_start=False,
+                outcome="selected",
+            ))
+
+        stopped = False
+        dynamic_returned = 0
+        for b, entry in zip(candidates, candidate_entries):
+            if stopped:
+                entry.update(outcome="not_attempted_after_break")
+                continue
             if token_budget <= 0:
-                break
+                entry.update(outcome="token_exhausted", budget_before=token_budget)
+                stopped = True
+                continue
+            budget_before = token_budget
             summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
             summary_tokens = count_tokens_approx(summary)
             if summary_tokens > token_budget:
-                break
+                entry.update(
+                    outcome="summary_exceeds_budget",
+                    reason="summary_too_large",
+                    summary_tokens=summary_tokens,
+                    budget_before=budget_before,
+                )
+                stopped = True
+                continue
             await bucket_mgr.soft_touch(b["id"])
             parts.append(summary)
             token_budget -= summary_tokens
+            dynamic_returned += 1
+            entry.update(
+                outcome="surfaced",
+                output_position=dynamic_returned,
+                summary_tokens=summary_tokens,
+                budget_before=budget_before,
+            )
+
+        audit_entries.extend(candidate_entries)
+        _record_surface_audit(
+            "breath_hook",
+            audit_entries,
+            total_buckets=len(all_buckets),
+            pinned_count=len(pinned),
+            dynamic_pool_count=len(_ranked_all),
+            dream_reserved_count=len(dream_recent),
+            candidate_count=len(candidates),
+            returned_count=len(parts),
+            pinned_returned_count=len(parts) - dynamic_returned,
+            dynamic_returned_count=dynamic_returned,
+            max_results=20,
+            max_tokens=10000,
+            remaining_tokens=token_budget,
+            status="complete",
+        )
 
         if not parts:
             await _fire_webhook("breath_hook", {"surfaced": 0})
@@ -420,7 +534,16 @@ async def dream_hook(request):
         recent = _select_dream_recent(all_buckets)
 
         if not recent:
+            _record_surface_audit(
+                "dream_hook", [], total_buckets=len(all_buckets), returned_count=0, status="complete"
+            )
             return PlainTextResponse("")
+
+        try:
+            ranked, weight_ranks, scores = _weight_rank_snapshot(all_buckets)
+        except Exception as exc:
+            logger.warning("Dream hook rank snapshot failed: %s", type(exc).__name__)
+            ranked, weight_ranks, scores = [], {}, {}
 
         parts = []
         for b in recent:
@@ -433,6 +556,25 @@ async def dream_hook(request):
             )
 
         body_text = "[Ombre Brain - Dreaming]\n" + "\n---\n".join(parts)
+        _record_surface_audit(
+            "dream_hook",
+            [
+                _audit_bucket_entry(
+                    b,
+                    channel="dream",
+                    score=scores.get(b["id"]),
+                    weight_rank=weight_ranks.get(b["id"]),
+                    newest_position=index,
+                    output_position=index,
+                    outcome="surfaced",
+                )
+                for index, b in enumerate(recent, start=1)
+            ],
+            total_buckets=len(all_buckets),
+            dynamic_pool_count=len(ranked),
+            returned_count=len(recent),
+            status="complete",
+        )
         await _fire_webhook("dream_hook", {"surfaced": len(parts), "chars": len(body_text)})
         return PlainTextResponse(body_text)
     except Exception as e:
@@ -602,18 +744,42 @@ async def breath(
             feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
             feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
             if not feels:
+                _record_surface_audit(
+                    "feel", [], total_buckets=len(all_buckets), returned_count=0, status="complete"
+                )
                 return "没有留下过 feel。"
             feels = feels[:10]
             results = []
-            for f in feels:
+            audit_entries = []
+            for newest_position, f in enumerate(feels, start=1):
                 created = f["metadata"].get("created", "")
                 entry = f"[{created}] [bucket_id:{f['id']}]\n{strip_wikilinks(f['content'])}"
                 results.append(entry)
+                audit_entries.append(_audit_bucket_entry(
+                    f,
+                    channel="feel",
+                    newest_position=newest_position,
+                    output_position=len(results),
+                    outcome="surfaced",
+                ))
                 if count_tokens_approx("\n---\n".join(results)) > max_tokens:
                     break
+            _record_surface_audit(
+                "feel",
+                audit_entries,
+                total_buckets=len(all_buckets),
+                candidate_count=len(feels),
+                returned_count=len(results),
+                max_results=10,
+                max_tokens=max_tokens,
+                status="complete",
+            )
             return "=== 你留下的 feel ===\n" + "\n---\n".join(results)
         except Exception as e:
             logger.error(f"Feel retrieval failed: {e}")
+            _record_surface_audit(
+                "feel", [], returned_count=0, status="error", error=type(e).__name__
+            )
             return "读取 feel 失败。"
 
     # --- No args or empty query: surfacing mode (weight pool active push) ---
@@ -627,7 +793,20 @@ async def breath(
 
         # Reserve Dreaming's newest memories before breath weight ranking.
         # 在权重排序前先留出 Dreaming 的最新记忆，避免启动流程重复注入。
-        dream_ids = {b["id"] for b in _select_dream_recent(all_buckets)}
+        ranked_all, weight_ranks, score_snapshot = _weight_rank_snapshot(all_buckets)
+        dream_recent = _select_dream_recent(all_buckets)
+        dream_ids = {b["id"] for b in dream_recent}
+        audit_entries = [
+            _audit_bucket_entry(
+                b,
+                channel="dream_reserved",
+                score=score_snapshot.get(b["id"]),
+                weight_rank=weight_ranks.get(b["id"]),
+                newest_position=index,
+                outcome="reserved_for_dream",
+            )
+            for index, b in enumerate(dream_recent, start=1)
+        ]
 
         # --- Pinned/protected buckets: always surface as core principles ---
         # --- 钉选桶：作为核心准则，始终浮现 ---
@@ -637,13 +816,20 @@ async def breath(
         ]
         pinned_results = []
         for b in pinned_buckets:
+            audit_entry = _audit_bucket_entry(b, channel="pin", outcome="selected")
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
                 pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
+                audit_entry.update(
+                    outcome="surfaced",
+                    output_position=len(pinned_results),
+                    summary_tokens=count_tokens_approx(summary),
+                )
             except Exception as e:
                 logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
-                continue
+                audit_entry.update(outcome="dehydrate_error", reason=type(e).__name__)
+            audit_entries.append(audit_entry)
 
         # --- Unresolved buckets: surface top N by weight ---
         # --- 未解决桶：按权重浮现前 N 条 ---
@@ -663,9 +849,10 @@ async def breath(
 
         scored = sorted(
             unresolved,
-            key=lambda b: decay_engine.calculate_score(b["metadata"]),
+            key=lambda b: score_snapshot[b["id"]],
             reverse=True,
         )
+        breath_ranks = {b["id"]: index for index, b in enumerate(scored, start=1)}
 
         if scored:
             top_scores = [(b["metadata"].get("name", b["id"]), decay_engine.calculate_score(b["metadata"])) for b in scored[:5]]
@@ -704,23 +891,75 @@ async def breath(
         # Hard cap: never surface more than max_results buckets
         candidates = candidates[:max_results]
 
+        candidate_entries = [
+            _audit_bucket_entry(
+                b,
+                channel="dynamic",
+                score=score_snapshot.get(b["id"]),
+                weight_rank=weight_ranks.get(b["id"]),
+                breath_rank=breath_ranks.get(b["id"]),
+                candidate_position=index,
+                cold_start=b["id"] in cold_start_ids,
+                outcome="selected",
+            )
+            for index, b in enumerate(candidates, start=1)
+        ]
+
         dynamic_results = []
-        for b in candidates:
+        stopped = False
+        for b, audit_entry in zip(candidates, candidate_entries):
+            if stopped:
+                audit_entry.update(outcome="not_attempted_after_break")
+                continue
             if token_budget <= 0:
-                break
+                audit_entry.update(outcome="token_exhausted", budget_before=token_budget)
+                stopped = True
+                continue
             try:
+                budget_before = token_budget
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
                 summary_tokens = count_tokens_approx(summary)
                 if summary_tokens > token_budget:
-                    break
+                    audit_entry.update(
+                        outcome="summary_exceeds_budget",
+                        reason="summary_too_large",
+                        summary_tokens=summary_tokens,
+                        budget_before=budget_before,
+                    )
+                    stopped = True
+                    continue
                 await bucket_mgr.soft_touch(b["id"])
                 score = decay_engine.calculate_score(b["metadata"])
                 dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
                 token_budget -= summary_tokens
+                audit_entry.update(
+                    outcome="surfaced",
+                    output_position=len(dynamic_results),
+                    summary_tokens=summary_tokens,
+                    budget_before=budget_before,
+                )
             except Exception as e:
                 logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
-                continue
+                audit_entry.update(outcome="dehydrate_error", reason=type(e).__name__)
+
+        audit_entries.extend(candidate_entries)
+        _record_surface_audit(
+            "breath",
+            audit_entries,
+            total_buckets=len(all_buckets),
+            pinned_count=len(pinned_buckets),
+            dynamic_pool_count=len(ranked_all),
+            dream_reserved_count=len(dream_recent),
+            candidate_count=len(candidates),
+            returned_count=len(pinned_results) + len(dynamic_results),
+            pinned_returned_count=len(pinned_results),
+            dynamic_returned_count=len(dynamic_results),
+            max_results=max_results,
+            max_tokens=max_tokens,
+            remaining_tokens=token_budget,
+            status="complete",
+        )
 
         if not pinned_results and not dynamic_results:
             return "权重池平静，没有需要处理的记忆。"
@@ -1347,7 +1586,16 @@ async def dream() -> str:
     recent = _select_dream_recent(all_buckets)
 
     if not recent:
+        _record_surface_audit(
+            "dream", [], total_buckets=len(all_buckets), returned_count=0, status="complete"
+        )
         return "没有需要消化的新记忆。"
+
+    try:
+        ranked, weight_ranks, score_snapshot = _weight_rank_snapshot(all_buckets)
+    except Exception as exc:
+        logger.warning("Dream rank snapshot failed: %s", type(exc).__name__)
+        ranked, weight_ranks, score_snapshot = [], {}, {}
 
     parts = []
     for b in recent:
@@ -1440,6 +1688,27 @@ async def dream() -> str:
             logger.warning(f"Dream crystallization hint failed: {e}")
 
     final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint
+    _record_surface_audit(
+        "dream",
+        [
+            _audit_bucket_entry(
+                b,
+                channel="dream",
+                score=score_snapshot.get(b["id"]),
+                weight_rank=weight_ranks.get(b["id"]),
+                newest_position=index,
+                output_position=index,
+                outcome="surfaced",
+            )
+            for index, b in enumerate(recent, start=1)
+        ],
+        total_buckets=len(all_buckets),
+        dynamic_pool_count=len(ranked),
+        candidate_count=len(recent),
+        returned_count=len(recent),
+        max_results=DREAM_RECENT_LIMIT,
+        status="complete",
+    )
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
 
@@ -2035,6 +2304,27 @@ async def api_admin_tagging_diagnostics(request):
     err = _require_auth(request)
     if err: return err
     return JSONResponse(list(dehydrator.recent_tagging_failures))
+
+
+@mcp.custom_route("/api/admin/surface-audit", methods=["GET"])
+async def api_admin_surface_audit(request):
+    """Authenticated metadata-only history of Breath/Dream/Feel selections."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        limit = int(request.query_params.get("limit", 20))
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(surface_audit.max_events, limit))
+    try:
+        return JSONResponse({
+            "retention": surface_audit.max_events,
+            "events": surface_audit.recent(limit),
+        })
+    except Exception as exc:
+        logger.exception("Surface audit read failed")
+        return JSONResponse({"error": type(exc).__name__}, status_code=500)
 
 
 @mcp.custom_route("/api/admin/diagnostics", methods=["GET"])

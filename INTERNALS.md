@@ -127,6 +127,7 @@
 | `/api/search?q=` | GET | 搜索 🔒 |
 | `/api/network` | GET | 向量相似网络 🔒 |
 | `/api/breath-debug` | GET | 评分调试 🔒 |
+| `/api/admin/surface-audit` | GET | 最近 50 次 Breath/Dream/feel 浮现审计（仅 ID/名称/排名/结果，无正文）🔒 |
 | `/api/config` | GET | 配置查看（key 脱敏）🔒 |
 | `/api/config` | POST | 热更新配置 🔒 |
 | `/api/status` | GET | 系统状态（版本/桶数/引擎）🔒 |
