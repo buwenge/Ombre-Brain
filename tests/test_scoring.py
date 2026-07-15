@@ -103,6 +103,77 @@ class TestTimeWeight:
             assert decay_eng._calc_time_weight(d) >= 1.0
 
 
+class TestContinuousWeightHandoff:
+    """Freshness hands off to emotion without the old three-day cliff."""
+
+    @pytest.mark.parametrize(
+        ("days", "expected_time", "expected_emotion"),
+        [
+            (0, 0.70, 0.30),
+            (3, 0.50, 0.50),
+            (6, 0.40, 0.60),
+            (9, 0.35, 0.65),
+            (12, 0.325, 0.675),
+            (15, 0.3125, 0.6875),
+        ],
+    )
+    def test_three_day_half_distance_anchors(
+        self, decay_eng, days, expected_time, expected_emotion
+    ):
+        time_share, emotion_share = decay_eng._calc_weight_shares(days)
+        assert time_share == pytest.approx(expected_time)
+        assert emotion_share == pytest.approx(expected_emotion)
+        assert time_share + emotion_share == pytest.approx(1.0)
+
+    def test_no_discontinuity_at_day_three(self, decay_eng):
+        before = decay_eng._calc_weight_shares(3.0 - 1e-6)
+        at_boundary = decay_eng._calc_weight_shares(3.0)
+        after = decay_eng._calc_weight_shares(3.0 + 1e-6)
+
+        assert before[0] == pytest.approx(at_boundary[0], abs=1e-7)
+        assert after[0] == pytest.approx(at_boundary[0], abs=1e-7)
+        assert before[1] == pytest.approx(at_boundary[1], abs=1e-7)
+        assert after[1] == pytest.approx(at_boundary[1], abs=1e-7)
+
+    def test_score_does_not_rise_from_time_alone(self, decay_eng, monkeypatch):
+        """Across realistic metadata ranges, elapsed time alone cannot add score."""
+        current_day = [0.0]
+        monkeypatch.setattr(
+            decay_eng,
+            "days_since_active",
+            lambda _metadata: current_day[0],
+        )
+
+        for arousal in (0.0, 0.3, 0.7, 0.71, 0.9, 1.0):
+            for activation_count in (0, 1, 5, 20, 50, 100):
+                for resolved, digested in (
+                    (False, False),
+                    (False, True),
+                    (True, False),
+                    (True, True),
+                ):
+                    metadata = {
+                        "type": "dynamic",
+                        "importance": 7,
+                        "activation_count": activation_count,
+                        "arousal": arousal,
+                        "resolved": resolved,
+                        "digested": digested,
+                    }
+                    previous = None
+                    for hour in range(0, 30 * 24 + 1):
+                        current_day[0] = hour / 24.0
+                        score = decay_eng.calculate_score(metadata)
+                        if previous is not None:
+                            assert score <= previous + 1e-4, (
+                                f"score rose at day {current_day[0]:.3f}: "
+                                f"arousal={arousal}, activation={activation_count}, "
+                                f"resolved={resolved}, digested={digested}, "
+                                f"{previous} -> {score}"
+                            )
+                        previous = score
+
+
 # ============================================================
 # Decay score special bucket types
 # ============================================================

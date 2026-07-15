@@ -22,3 +22,5 @@ tests/unit/
 
 # Local work journal — contains personal relationship content, repo is public
 CLAUDE.md
+AGENTS.md
+sol-memory.md

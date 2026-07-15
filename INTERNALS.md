@@ -24,7 +24,7 @@
 - `created`、`last_active` 时间戳
 
 **四种检索模式**
-1. **自动浮现**（`breath()` 无参数）：按衰减分排序推送，钉选桶始终展示，Top-1 固定 + Top-20 随机打乱（引入多样性），有 token 预算（默认 10000）
+1. **自动浮现**（`breath()` 无参数）：先用 dream 的统一规则预留最新 10 条，再对其余未解决桶按衰减分排序；钉选桶始终展示，Top-1 固定 + Top-20 随机打乱（引入多样性）。动态桶条数上限（默认 20）与 token 预算（默认 10000）同时生效，谁先达到就停止
 2. **关键词+向量双通道搜索**（`breath(query=...)`）：rapidfuzz 模糊匹配 + Gemini embedding 余弦相似度，合并去重
 3. **Feel 独立检索**（`breath(domain="feel")`）：按创建时间倒序返回所有 feel
 4. **随机浮现**：搜索结果 <3 条时 40% 概率漂浮 1~3 条低权重旧桶（模拟人类随机联想）
@@ -39,9 +39,9 @@
 **记忆随时间变化**
 - **衰减引擎**：改进版艾宾浩斯遗忘曲线
   - 公式：`Score = Importance × activation_count^0.3 × e^(-λ×days) × combined_weight`
-  - 短期（≤3天）：时间权重 70% + 情感权重 30%
-  - 长期（>3天）：情感权重 70% + 时间权重 30%
+  - 新鲜度→情感连续交接：刚激活 70%/30%，第 3 天 50%/50%，第 6 天 40%/60%，长期趋近 30%/70%
   - 新鲜度加成：`1.0 + e^(-t/36h)`，刚存入 ×2.0，~36h 半衰，72h 后 ≈×1.0
+  - 关系时钟冻结：Dashboard 可冻结全局衰减；冻结区间从 `days_since` 扣除并持久化，正常 Breath 排名前或任意真实激活时自动解冻
   - 高唤醒度(arousal>0.7)且未解决 → ×1.5 紧迫度加成
   - resolved → ×0.05 沉底；resolved+digested → ×0.02 加速淡化
 - **自动归档**：score 低于阈值(0.3) → 移入 archive
@@ -86,7 +86,7 @@
 **工具详细行为**
 
 **`breath`** — 三种模式：
-- **浮现模式**（无 query）：无参调用，按衰减引擎活跃度排序返回 top 记忆，钉选桶始终展示；冷启动检测（`activation_count==0 && importance>=8`）的桶最多 2 个插入最前，再 Top-1 固定 + Top-20 随机打乱
+- **浮现模式**（无 query）：无参调用，先排除留给 dream 的最新 10 条，再按衰减引擎活跃度排序返回其余记忆，钉选桶始终展示；冷启动检测（`activation_count==0 && importance>=8`）的桶最多 2 个插入最前，再 Top-1 固定 + Top-20 随机打乱
 - **检索模式**（有 query）：关键词 + 向量双通道搜索，四维评分（topic×4 + emotion×2 + time×2.5 + importance×1），阈值过滤
 - **Feel 检索**（`domain="feel"`）：特殊通道，按创建时间倒序返回所有 feel 类型桶，不走评分逻辑
 - **重要度批量模式**（`importance_min>=1`）：跳过语义搜索，直接筛选 importance≥importance_min 的桶，按 importance 降序，最多 20 条
@@ -97,7 +97,7 @@
 - **Feel 模式**（`feel=True`）：跳过 LLM 分析，直接存为 `feel` 类型桶（存入 `feel/` 目录），不参与普通浮现/衰减/合并。若提供 `source_bucket`，标记源记忆为 `digested=True` 并写入 `model_valence`。返回格式：`🫧feel→{bucket_id}`
 
 **`dream`** — 做梦/自省触发器：
-- 返回最近 10 条 dynamic 桶摘要 + 自省引导词
+- 返回统一预留的最近 10 条 dynamic 桶摘要 + 自省引导词；这 10 条不会再出现在无参 breath 中
 - 检测 feel 结晶化：≥3 条相似 feel（embedding 相似度>0.7）→ 提示升级为钉选准则
 - 检测未消化记忆：列出 `digested=False` 的桶供模型反思
 
@@ -113,7 +113,7 @@
 **`pulse`** — 系统状态：
 - 返回各类型桶数量、衰减引擎状态、未解决/钉选/feel 统计
 
-**REST API（17 个端点）**
+**REST API**
 
 | 端点 | 方法 | 功能 |
 |---|---|---|
@@ -121,6 +121,7 @@
 | `/breath-hook` | GET | SessionStart 钩子 |
 | `/dream-hook` | GET | Dream 钩子 |
 | `/dashboard` | GET | Dashboard 页面 |
+| `/api/decay-freeze` | GET/POST | 查询或切换全局衰减冻结 🔒 |
 | `/api/buckets` | GET | 桶列表 🔒 |
 | `/api/bucket/{id}` | GET | 桶详情 🔒 |
 | `/api/search?q=` | GET | 搜索 🔒 |
@@ -216,6 +217,7 @@
 | `server.py` | MCP 服务器主入口，注册工具 + Dashboard API + 钩子端点 | `bucket_manager`, `dehydrator`, `decay_engine`, `embedding_engine`, `utils` | `test_tools.py` |
 | `bucket_manager.py` | 记忆桶 CRUD、多维索引搜索、wikilink 注入、激活更新 | `utils` | `server.py`, `check_buckets.py`, `backfill_embeddings.py` |
 | `decay_engine.py` | 衰减引擎：遗忘曲线计算、自动归档、自动结案 | 无（接收 `bucket_mgr` 实例） | `server.py` |
+| `relationship_clock.py` | 持久关系时钟：记录冻结区间、计算排除冻结后的有效天数 | 无 | `decay_engine.py` |
 | `dehydrator.py` | 数据脱水压缩 + 合并 + 自动打标（仅 LLM API，不可用时报 RuntimeError） | `utils` | `server.py` |
 | `embedding_engine.py` | 向量化引擎：Gemini embedding API + SQLite + 余弦搜索 | `utils` | `server.py`, `backfill_embeddings.py` |
 | `utils.py` | 配置加载、日志、路径安全、ID 生成、token 估算 | 无 | 所有模块 |
@@ -249,8 +251,8 @@
 |---|---|---|
 | `36.0` | `decay_engine.py` _calc_time_weight | 新鲜度半衰期（小时），`1.0 + e^(-t/36)` |
 | `0.3` (指数) | `decay_engine.py` calculate_score | `activation_count ** 0.3`（记忆巩固指数） |
-| `3.0` (天) | `decay_engine.py` calculate_score | 短期/长期切换阈值 |
-| `0.7 / 0.3` | `decay_engine.py` combined_weight | 短期权重分配：time×0.7 + emotion×0.3 |
+| `3.0` (天) | `decay_engine.py` _calc_weight_shares | 距离长期配比的减半周期；不是切换阈值 |
+| `0.7 / 0.3` | `decay_engine.py` _calc_weight_shares | 长期情感/时间配比；刚激活时顺序相反 |
 | `0.7` | `decay_engine.py` urgency_boost | arousal 紧迫度触发阈值 |
 | `4` / `30` (天) | `decay_engine.py` execute_cycle | 自动结案：importance≤4 且 >30天 |
 
@@ -419,14 +421,14 @@
 
 **放弃方案**：直接删除。不可逆，且与人类记忆模型不符。
 
-### 5.7 为什么用分段式短期/长期权重？
+### 5.7 为什么让新鲜度连续交接给情感权重？
 
-**决策**：≤3 天时间权重占 70%，>3 天情感权重占 70%。
+**决策**：刚激活时新鲜度占 70%，距离长期的情感 70% 配比每 3 天减半；第 3 天恰为 50%/50%，不设硬切换。
 
 **理由**：
 - 刚发生的事主要靠"新鲜"驱动浮现（今天的事 > 昨天的事）
 - 时间久了，决定记忆存活的是情感强度（强烈的记忆更难忘）
-- 这比单一衰减曲线更符合人类记忆的双重存储理论
+- 连续交接保留短期/长期侧重，又避免旧设计在第三天让分数突然跳变
 
 ### 5.8 为什么 dream 设计成对话开头自动执行？
 

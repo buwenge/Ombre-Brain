@@ -51,20 +51,21 @@ breath(query="", max_tokens=10000, domain="", valence=-1, arousal=-1, max_result
 1. `decay_engine.ensure_started()` — 懒加载启动后台衰减循环（若未运行）
 2. 进入"浮现模式"（`not query or not query.strip()`）
 3. `bucket_mgr.list_all(include_archive=False)` — 遍历 `permanent/` + `dynamic/` + `feel/` 目录，加载所有 `.md` 文件的 frontmatter + 正文
-4. 筛选钉选桶（`pinned=True` 或 `protected=True`）
-5. 筛选未解决桶（`resolved=False`，排除 `permanent/feel/pinned`）
-6. **冷启动检测**：找 `activation_count==0 && importance>=8` 的桶，最多取 2 个插入排序最前（**决策：`create()` 初始化应为 0，区分"创建"与"被主动召回"，见 B-04**）
-7. 按 `decay_engine.calculate_score(metadata)` 降序排列剩余未解决桶
-8. 对 top-20 以外随机洗牌（top-1 固定，2~20 随机）
-9. 截断到 `max_results` 条
-10. 对每个桶调用 `dehydrator.dehydrate(strip_wikilinks(content), clean_meta)` 压缩摘要
-11. 按 `max_tokens` 预算截断输出
+4. 用与 `dream()` 相同的规则按 `created` 倒序预留最新 10 条非 permanent/feel/letter/pinned/protected 桶
+5. 筛选钉选桶（`pinned=True` 或 `protected=True`）
+6. 筛选未解决桶（`resolved=False`，排除 `permanent/feel/letter/pinned` 以及上一步 dream 预留 ID）
+7. **冷启动检测**：找 `activation_count==0 && importance>=8` 的桶，最多取 2 个插入排序最前（**决策：`create()` 初始化应为 0，区分"创建"与"被主动召回"，见 B-04**）
+8. 按 `decay_engine.calculate_score(metadata)` 降序排列剩余未解决桶
+9. 保留 top-1，随机打乱第 2~20 名
+10. 截断到 `max_results` 条
+11. 对每个桶调用 `dehydrator.dehydrate(strip_wikilinks(content), clean_meta)` 压缩摘要
+12. 按 `max_tokens` 预算截断输出；`max_results` 与 `max_tokens` 同时为硬上限，先达到任一上限即停止
 
 **返回结果**：
 - 无记忆时：`"权重池平静，没有需要处理的记忆。"`
 - 有记忆时：`"=== 核心准则 ===\n📌 ...\n\n=== 浮现记忆 ===\n[权重:X.XX] [bucket_id:xxx] ..."`
 
-**注意**：浮现模式**不调用** `touch()`，不重置衰减计时器
+**注意**：浮现模式不调用完整 `touch()`，不会刷新单桶 `last_active`；成功输出后只做 `soft_touch(+0.1)`。若全局关系时钟已冻结，正常 Breath 会先结算冻结区间并解冻，再进行本次权重排序。
 
 ---
 
@@ -292,17 +293,18 @@ trace(bucket_id="abc123", delete=True)
 3. **自动 resolve**：若 `importance <= 4` 且距上次激活 > 30 天且 `resolved=False` → `bucket_mgr.update(bucket_id, resolved=True)`
 4. 对每桶调用 `calculate_score(metadata)`：
 
-   **短期（days_since ≤ 3）**：
+   **连续的新鲜度 → 情感权重交接**：
    ```
    time_weight = 1.0 + e^(-hours/36)  (t=0→×2.0, t=36h→×1.5)
    emotion_weight = base(1.0) + arousal × arousal_boost(0.8)
-   combined = time_weight×0.7 + emotion_weight×0.3
+   remaining_gap = 0.4 × 2^(-days/3)
+   emotion_share = 0.7 - remaining_gap
+   time_share = 1.0 - emotion_share
+   combined = time_weight×time_share + emotion_weight×emotion_share
    base_score = importance × activation_count^0.3 × e^(-λ×days) × combined
    ```
-   **长期（days_since > 3）**：
-   ```
-   combined = emotion_weight×0.7 + time_weight×0.3
-   ```
+   刚激活时 time/emotion=70%/30%，第 3 天为 50%/50%，第 6 天为
+   40%/60%；此后连续趋近长期的 30%/70%，没有三天硬切换。
    **修正因子**：
    - `resolved=True` → ×0.05
    - `resolved=True && digested=True` → ×0.02
@@ -311,6 +313,8 @@ trace(bucket_id="abc123", delete=True)
    - `type=="feel"` → 返回 50.0（固定）
 
 5. `score < threshold`（默认 0.3）→ `bucket_mgr.archive(bucket_id)` → `_move_bucket()` 将文件从 `dynamic/` 移动到 `archive/` 目录，更新 frontmatter `type="archived"`
+
+**关系时钟冻结**：Dashboard 的 `/api/decay-freeze` 可开始全局冻结。`calculate_score()` 与 30 天自动结案都使用扣除冻结区间后的有效天数；冻结状态写入 `.decay_freeze.json`，重启不丢。正常 Breath 在排名前解冻，成功的 `touch()` / `soft_touch()` / `update(touch=True)` 也会解冻；Dashboard 纠错、补标、自动结案和历史导入合并使用 `touch=False`，不解冻。
 
 **返回 stats**：`{"checked": N, "archived": N, "auto_resolved": N, "lowest_score": X}`
 
@@ -324,8 +328,8 @@ trace(bucket_id="abc123", delete=True)
 
 **系统内部发生什么**：
 
-1. `bucket_mgr.list_all()` → 过滤非 `permanent/feel/pinned/protected` 桶
-2. 按 `created` 降序取前 10 条（最近新增的记忆）
+1. `bucket_mgr.list_all()` → 过滤非 `permanent/feel/letter/pinned/protected` 桶
+2. 按 `created` 降序取统一预留的前 10 条（最近新增的记忆）；无参 breath 已排除同一组 ID
 3. 对每条拼接：名称、resolved 状态、domain、V/A、创建时间、正文前 500 字符
 4. **连接提示**（embedding 已开启 && 桶数 >= 2）：
    - 取每个最近桶的 embedding（`embedding_engine.get_embedding(bucket_id)`）
@@ -620,7 +624,7 @@ feel 桶自身:
 - `breath()` 浮现模式不调用 `touch()`，不重置衰减计时器
 - `feel` 桶 `calculate_score()` 返回固定 50.0，永不归档
 - `breath(domain="feel")` 独立通道，按 `created` 降序，不压缩展示原文
-- `decay_engine.calculate_score()` 短期（≤3天）/ 长期（>3天）权重分离公式
+- `decay_engine.calculate_score()` 新鲜度向情感权重连续交接，无三天硬切换
 - `urgency_boost`：`arousal > 0.7 && !resolved → ×1.5`
 - `dream()` 连接提示（best_sim > 0.5）+ 结晶提示（feel 相似度 > 0.7 × ≥2 个）
 - 所有 `/api/*` Dashboard 路由均受 `_require_auth` 保护

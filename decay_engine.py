@@ -22,7 +22,8 @@
 import math
 import asyncio
 import logging
-from datetime import datetime
+
+from relationship_clock import RelationshipClock
 
 logger = logging.getLogger("ombre_brain.decay")
 
@@ -50,6 +51,7 @@ class DecayEngine:
         self.arousal_boost = emotion_cfg.get("arousal_boost", 0.8)
 
         self.bucket_mgr = bucket_mgr
+        self.relationship_clock = RelationshipClock(config["buckets_dir"])
 
         # --- Background task control / 后台任务控制 ---
         self._task: asyncio.Task | None = None
@@ -89,12 +91,8 @@ class DecayEngine:
         Calculate current activity score for a memory bucket.
         计算一个记忆桶的当前活跃度得分。
 
-        New model: short-term vs long-term weight separation.
-        新模型：短期/长期权重分离。
-        - Short-term (≤3 days): time_weight dominates, emotion amplifies
-        - Long-term (>3 days): emotion_weight dominates, time decays to floor
-        短期（≤3天）：时间权重主导，情感放大
-        长期（>3天）：情感权重主导，时间衰减到底线
+        New model: freshness gradually hands off to emotional weight.
+        新模型：新鲜度随关系时间逐渐把主导权交给情感权重。
         """
         if not isinstance(metadata, dict):
             return 0.0
@@ -119,12 +117,7 @@ class DecayEngine:
         activation_count = max(1.0, float(metadata.get("activation_count", 1)))
 
         # --- Days since last activation ---
-        last_active_str = metadata.get("last_active", metadata.get("created", ""))
-        try:
-            last_active = datetime.fromisoformat(str(last_active_str))
-            days_since = max(0.0, (datetime.now() - last_active).total_seconds() / 86400)
-        except (ValueError, TypeError):
-            days_since = 30
+        days_since = self.days_since_active(metadata)
 
         # --- Emotion weight ---
         try:
@@ -138,15 +131,12 @@ class DecayEngine:
         raw_time_weight = self._calc_time_weight(days_since)
         time_weight = 1.0 + (raw_time_weight - 1.0) / (1.0 + 0.1 * activation_count)
 
-        # --- Short-term vs Long-term weight separation ---
-        # 短期（≤3天）：time_weight 占 70%，emotion 占 30%
-        # 长期（>3天）：emotion 占 70%，time_weight 占 30%
-        if days_since <= 3.0:
-            # Short-term: time dominates, emotion amplifies
-            combined_weight = time_weight * 0.7 + emotion_weight * 0.3
-        else:
-            # Long-term: emotion dominates, time provides baseline
-            combined_weight = emotion_weight * 0.7 + time_weight * 0.3
+        # --- Continuous freshness → emotion handoff ---
+        # 刚激活时 time/emotion = 70%/30%；此后剩余差距每 3 天减半。
+        # Day 3 = 50%/50%, Day 6 = 40%/60%, then asymptotically 30%/70%.
+        # This removes the old discontinuous <=3 / >3 day branch.
+        time_share, emotion_share = self._calc_weight_shares(days_since)
+        combined_weight = time_weight * time_share + emotion_weight * emotion_share
 
         # --- Base score ---
         base_score = (
@@ -179,6 +169,28 @@ class DecayEngine:
             urgency_boost = 1.0
 
         return round(base_score * resolved_factor * urgency_boost, 4)
+
+    @staticmethod
+    def _calc_weight_shares(days_since: float) -> tuple[float, float]:
+        """Return continuous (freshness, emotion) shares for elapsed days.
+
+        The distance from the long-term 30%/70% mix halves every three days:
+        day 0 = 70%/30%, day 3 = 50%/50%, day 6 = 40%/60%.
+        距离长期 30%/70% 配比的差距每三天减半，不再在第三天硬切换。
+        """
+        elapsed = max(0.0, float(days_since))
+        remaining = 0.4 * math.pow(0.5, elapsed / 3.0)
+        emotion_share = 0.7 - remaining
+        time_share = 1.0 - emotion_share
+        return time_share, emotion_share
+
+    def days_since_active(self, metadata: dict) -> float:
+        """Decay elapsed time with user-declared frozen intervals removed."""
+        last_active_str = metadata.get("last_active", metadata.get("created", ""))
+        return self.relationship_clock.effective_days_since(
+            last_active_str,
+            fallback_days=30.0,
+        )
 
     # ---------------------------------------------------------
     # Execute one decay cycle
@@ -219,15 +231,10 @@ class DecayEngine:
             # --- 自动结案：重要度≤4 + 超过30天 + 未解决 → 自动 resolve ---
             if not meta.get("resolved", False):
                 imp = int(meta.get("importance", 5))
-                last_active_str = meta.get("last_active", meta.get("created", ""))
-                try:
-                    last_active = datetime.fromisoformat(str(last_active_str))
-                    days_since = (datetime.now() - last_active).total_seconds() / 86400
-                except (ValueError, TypeError):
-                    days_since = 999
+                days_since = self.days_since_active(meta)
                 if imp <= 4 and days_since > 30:
                     try:
-                        await self.bucket_mgr.update(bucket["id"], resolved=True)
+                        await self.bucket_mgr.update(bucket["id"], touch=False, resolved=True)
                         meta["resolved"] = True  # refresh local meta so resolved_factor applies this cycle
                         auto_resolved += 1
                         logger.info(

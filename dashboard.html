@@ -607,6 +607,7 @@
   <div class="search-bar">
     <input type="text" id="search-input" placeholder="搜索记忆…" />
   </div>
+  <button id="decay-freeze-btn" onclick="toggleDecayFreeze()" title="暂别期间停止计算记忆衰减" style="margin-left:12px;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:20px;padding:6px 14px;font-size:12px;cursor:pointer;">冻结衰减</button>
   <button onclick="doLogout()" title="退出登录" style="margin-left:12px;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:20px;padding:6px 14px;font-size:12px;cursor:pointer;">退出</button>
 </div>
 
@@ -899,6 +900,7 @@ async function doSetup() {
   const resp = await fetch('/auth/setup', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: p1}) });
   if (resp.ok) {
     document.getElementById('auth-overlay').style.display = 'none';
+    loadFreezeStatus();
   } else {
     const d = await resp.json();
     showAuthError(d.detail || '设置失败');
@@ -910,6 +912,7 @@ async function doLogin() {
   const resp = await fetch('/auth/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: pwd}) });
   if (resp.ok) {
     document.getElementById('auth-overlay').style.display = 'none';
+    loadFreezeStatus();
   } else {
     const d = await resp.json();
     showAuthError(d.detail || '密码错误');
@@ -1029,6 +1032,48 @@ async function authFetch(url, options) {
     return null;
   }
   return resp;
+}
+
+let decayFrozen = false;
+
+async function loadFreezeStatus() {
+  const button = document.getElementById('decay-freeze-btn');
+  try {
+    const resp = await authFetch('/api/decay-freeze');
+    if (!resp) return;
+    const state = await resp.json();
+    decayFrozen = !!state.frozen;
+    button.textContent = decayFrozen ? '❄ 衰减已冻结' : '冻结衰减';
+    button.style.color = decayFrozen ? 'var(--accent)' : 'var(--text-dim)';
+    button.style.borderColor = decayFrozen ? 'var(--accent)' : 'var(--border)';
+    button.title = decayFrozen
+      ? '冻结开始于 ' + (state.frozen_since || '未知时间') + '；下次正常开窗或真正激活记忆时会自动解冻，点击可手动取消'
+      : '暂别期间停止计算记忆衰减';
+  } catch (e) {
+    button.textContent = '冻结状态未知';
+  }
+}
+
+async function toggleDecayFreeze() {
+  const target = !decayFrozen;
+  const button = document.getElementById('decay-freeze-btn');
+  button.disabled = true;
+  try {
+    const resp = await authFetch('/api/decay-freeze', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({frozen: target}),
+    });
+    if (!resp) return;
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const state = await resp.json();
+    decayFrozen = !!state.frozen;
+    await loadFreezeStatus();
+  } catch (e) {
+    button.textContent = '冻结操作失败';
+  } finally {
+    button.disabled = false;
+  }
 }
 
 // ========================================
@@ -1190,12 +1235,12 @@ async function showDetail(id) {
         '<div class="field"><label>类型</label>' + (meta.type || 'dynamic') + '</div>' +
         '<div class="field"><label>域</label>' + (meta.domain || []).join(', ') + '</div>' +
         '<div class="field"><label>标签</label>' + (meta.tags || []).join(', ') + '</div>' +
-        '<div class="field"><label>事件效价</label>V' + (meta.valence || 0.5).toFixed(2) + '</div>' +
-        '<div class="field"><label>唤醒度</label>A' + (meta.arousal || 0.3).toFixed(2) + '</div>' +
+        '<div class="field"><label>事件效价</label>V' + (meta.valence ?? 0.5).toFixed(2) + '</div>' +
+        '<div class="field"><label>唤醒度</label>A' + (meta.arousal ?? 0.3).toFixed(2) + '</div>' +
         '<div class="field"><label>模型视角</label>' + (meta.model_valence != null ? 'V' + meta.model_valence.toFixed(2) : '—') + '</div>' +
         '<div class="field"><label>重要度</label>' + (meta.importance || 5) + '/10</div>' +
         '<div class="field"><label>权重分</label>' + b.score.toFixed(4) + '</div>' +
-        '<div class="field"><label>激活次数</label>' + (meta.activation_count || 1) + '</div>' +
+        '<div class="field"><label>激活次数</label>' + (meta.activation_count ?? 1) + '</div>' +
         '<div class="field"><label>已解决</label>' + (meta.resolved ? '✓' : '—') + '</div>' +
         '<div class="field"><label>已消化</label>' + (meta.digested ? '✓' : '—') + '</div>' +
         '<div class="field"><label>钉选</label>' + (meta.pinned ? '✓' : '—') + '</div>' +
@@ -1209,8 +1254,8 @@ async function showDetail(id) {
         '<div style="margin-bottom:10px;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">标签（逗号分隔）</label><input type="text" id="edit-tags" value="' + esc((meta.tags || []).join(', ')) + '" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
         '<div style="display:flex;gap:10px;margin-bottom:10px;">' +
           '<div style="flex:1;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">重要度(1-10)</label><input type="number" id="edit-importance" value="' + (meta.importance || 5) + '" min="1" max="10" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
-          '<div style="flex:1;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">效价(0-1)</label><input type="number" id="edit-valence" value="' + (meta.valence || 0.5) + '" min="0" max="1" step="0.05" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
-          '<div style="flex:1;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">唤醒(0-1)</label><input type="number" id="edit-arousal" value="' + (meta.arousal || 0.3) + '" min="0" max="1" step="0.05" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
+          '<div style="flex:1;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">效价(0-1)</label><input type="number" id="edit-valence" value="' + (meta.valence ?? 0.5) + '" min="0" max="1" step="0.05" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
+          '<div style="flex:1;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">唤醒(0-1)</label><input type="number" id="edit-arousal" value="' + (meta.arousal ?? 0.3) + '" min="0" max="1" step="0.05" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
         '</div>' +
         '<div style="margin-bottom:10px;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">内容</label><textarea id="edit-content" style="width:100%;min-height:200px;padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;line-height:1.7;resize:vertical;font-family:inherit;">' + esc(b.content) + '</textarea></div>' +
         '<div style="display:flex;gap:8px;">' +
@@ -1255,7 +1300,7 @@ async function saveBucket(id) {
     });
     var data = await res.json();
     if (data.ok) {
-      statusEl.innerHTML = '<span style="color:var(--positive);">✓ 已保存: ' + data.updated.join(', ') + '</span>';
+      statusEl.innerHTML = '<span style="color:var(--positive);">✓ 已保存且未激活记忆: ' + data.updated.join(', ') + '</span>';
       loadBuckets();
       setTimeout(function() { showDetail(id); }, 500);
     } else {
@@ -1601,7 +1646,10 @@ async function saveConfig(persist) {
   }
 }
 
-checkAuth().then(() => loadBuckets());
+checkAuth().then(() => {
+  loadBuckets();
+  loadFreezeStatus();
+});
 
 // --- Import functions ---
 const uploadZone = document.getElementById('import-upload-zone');

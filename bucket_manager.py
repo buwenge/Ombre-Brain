@@ -61,6 +61,7 @@ class BucketManager:
         self.letter_dir = os.path.join(self.base_dir, "letters")
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
+        self._activation_callback = None
 
         # --- Wikilink config / 双链配置 ---
         wikilink_cfg = config.get("wikilink", {})
@@ -92,6 +93,27 @@ class BucketManager:
 
         # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
         self.embedding_engine = embedding_engine
+
+    def set_activation_callback(self, callback) -> None:
+        """Register a synchronous callback for successful memory activation.
+
+        Maintenance writes use ``touch=False`` and never call this callback.
+        维护写入使用 ``touch=False``，不会触发这个真实激活回调。
+        """
+        self._activation_callback = callback
+
+    def _notify_activation(self, bucket_id: str, mode: str) -> None:
+        if self._activation_callback is None:
+            return
+        try:
+            self._activation_callback(bucket_id, mode)
+        except Exception as exc:
+            # A clock-state failure must not make the memory activation fail.
+            logger.warning(
+                "Activation callback failed / 激活回调失败: %s (%s)",
+                bucket_id,
+                type(exc).__name__,
+            )
 
     # ---------------------------------------------------------
     # Create a new bucket
@@ -250,8 +272,9 @@ class BucketManager:
         更新桶的内容或元数据字段。
 
         touch=False skips the last_active refresh below — for maintenance
-        writes (e.g. re-tagging backfill) that must not reset the decay clock.
-        touch=False 跳过下面的 last_active 刷新——给"补标"这类维护性写入用，
+        writes (for example, Dashboard corrections or re-tagging backfills)
+        that must not reset the decay clock.
+        touch=False 跳过下面的 last_active 刷新——给前端纠错、补标等维护写入用，
         不能顺带把衰减时钟清零。
         """
         file_path = self._find_bucket_file(bucket_id)
@@ -329,6 +352,8 @@ class BucketManager:
             self._move_bucket(file_path, self.permanent_dir, domain)
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
+        if touch:
+            self._notify_activation(bucket_id, "update")
         return True
 
     # ---------------------------------------------------------
@@ -380,6 +405,7 @@ class BucketManager:
             post["activation_count"] = round(current + increment, 1)
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
+            self._notify_activation(bucket_id, "soft_touch")
         except Exception as e:
             logger.warning(f"Failed to soft-touch bucket / 轻触桶失败: {bucket_id}: {e}")
 
@@ -407,6 +433,8 @@ class BucketManager:
 
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
+
+            self._notify_activation(bucket_id, "touch")
 
             # --- Time ripple: boost nearby memories within ±48h ---
             # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---

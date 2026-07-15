@@ -102,6 +102,9 @@ embedding_engine = EmbeddingEngine(config)            # Embedding engine first (
 bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket manager / 记忆桶管理器
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
+bucket_mgr.set_activation_callback(
+    lambda _bucket_id, mode: decay_engine.relationship_clock.resume(f"bucket_{mode}")
+)
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
@@ -325,19 +328,45 @@ async def health_check(request):
 # /breath-hook endpoint: Dedicated hook for SessionStart
 # 会话启动专用挂载点
 # =============================================================
+DREAM_RECENT_LIMIT = 10
+
+
+def _select_dream_recent(all_buckets: list[dict], limit: int = DREAM_RECENT_LIMIT) -> list[dict]:
+    """Return the newest surface-level memories reserved for Dreaming.
+
+    Both breath paths call this before weight ranking so the same memories are
+    not injected twice during startup.  dream() and /dream-hook use this exact
+    helper as well, keeping the reservation deterministic without shared
+    per-session state.
+    返回留给 Dreaming 的最新表层记忆。breath 与 dream 共用同一筛选函数，
+    无需跨调用状态也能避免一次开窗重复注入。
+    """
+    candidates = [
+        b for b in all_buckets
+        if b["metadata"].get("type") not in ("permanent", "feel", "letter")
+        and not b["metadata"].get("pinned", False)
+        and not b["metadata"].get("protected", False)
+    ]
+    candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+    return candidates[:limit]
+
+
 @mcp.custom_route("/breath-hook", methods=["GET"])
 async def breath_hook(request):
     from starlette.responses import PlainTextResponse
     try:
+        decay_engine.relationship_clock.resume("breath_hook")
         all_buckets = await bucket_mgr.list_all(include_archive=False)
+        dream_ids = {b["id"] for b in _select_dream_recent(all_buckets)}
         # pinned
         pinned = [b for b in all_buckets if b["metadata"].get("pinned") or b["metadata"].get("protected")]
-        # top 2 unresolved by score
+        # unresolved by score, excluding the newest memories reserved for dream
         unresolved = [b for b in all_buckets
                       if not b["metadata"].get("resolved", False)
-                      and b["metadata"].get("type") not in ("permanent", "feel")
+                      and b["metadata"].get("type") not in ("permanent", "feel", "letter")
                       and not b["metadata"].get("pinned")
-                      and not b["metadata"].get("protected")]
+                      and not b["metadata"].get("protected")
+                      and b["id"] not in dream_ids]
         scored = sorted(unresolved, key=lambda b: decay_engine.calculate_score(b["metadata"]), reverse=True)
 
         parts = []
@@ -388,14 +417,7 @@ async def dream_hook(request):
     from starlette.responses import PlainTextResponse
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
-        candidates = [
-            b for b in all_buckets
-            if b["metadata"].get("type") not in ("permanent", "feel")
-            and not b["metadata"].get("pinned", False)
-            and not b["metadata"].get("protected", False)
-        ]
-        candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
-        recent = candidates[:10]
+        recent = _select_dream_recent(all_buckets)
 
         if not recent:
             return PlainTextResponse("")
@@ -515,6 +537,7 @@ async def breath(
     limit: int = -1,
 ) -> str:
     """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制浮现模式返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。bucket_id传入桶ID时直接获取该桶内容返回(不走搜索)。limit>=1时在关键词搜索模式下限制返回条数(不填则返回所有匹配结果)。"""
+    decay_engine.relationship_clock.resume("breath")
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
@@ -602,6 +625,10 @@ async def breath(
             logger.error(f"Failed to list buckets for surfacing / 浮现列桶失败: {e}")
             return "记忆系统暂时无法访问。"
 
+        # Reserve Dreaming's newest memories before breath weight ranking.
+        # 在权重排序前先留出 Dreaming 的最新记忆，避免启动流程重复注入。
+        dream_ids = {b["id"] for b in _select_dream_recent(all_buckets)}
+
         # --- Pinned/protected buckets: always surface as core principles ---
         # --- 钉选桶：作为核心准则，始终浮现 ---
         pinned_buckets = [
@@ -626,6 +653,7 @@ async def breath(
             and b["metadata"].get("type") not in ("permanent", "feel", "letter")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
+            and b["id"] not in dream_ids
         ]
 
         logger.info(
@@ -1314,17 +1342,9 @@ async def dream() -> str:
         logger.error(f"Dream failed to list buckets: {e}")
         return "记忆系统暂时无法访问。"
 
-    # --- Filter: recent surface-level dynamic buckets (not permanent/pinned/feel/letter) ---
-    candidates = [
-        b for b in all_buckets
-        if b["metadata"].get("type") not in ("permanent", "feel", "letter")
-        and not b["metadata"].get("pinned", False)
-        and not b["metadata"].get("protected", False)
-    ]
-
-    # --- Sort by creation time desc, take top 10 ---
-    candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
-    recent = candidates[:10]
+    # --- Same deterministic reservation used by both breath paths ---
+    # --- 与两条 breath 路径共用同一组确定性的最新记忆 ---
+    recent = _select_dream_recent(all_buckets)
 
     if not recent:
         return "没有需要消化的新记忆。"
@@ -1586,6 +1606,38 @@ async def letter_read(
 # Dashboard API endpoints (for lightweight Web UI)
 # 仪表板 API（轻量 Web UI 用）
 # =============================================================
+@mcp.custom_route("/api/decay-freeze", methods=["GET"])
+async def api_decay_freeze_status(request):
+    """Return the persistent relationship-clock freeze state."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    return JSONResponse(decay_engine.relationship_clock.status())
+
+
+@mcp.custom_route("/api/decay-freeze", methods=["POST"])
+async def api_decay_freeze_update(request):
+    """Freeze decay manually or cancel it from the authenticated Dashboard."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(body, dict) or not isinstance(body.get("frozen"), bool):
+        return JSONResponse({"error": "frozen must be boolean"}, status_code=400)
+    try:
+        if body["frozen"]:
+            status = decay_engine.relationship_clock.freeze()
+        else:
+            status = decay_engine.relationship_clock.resume("dashboard_manual")
+        return JSONResponse(status)
+    except OSError:
+        logger.exception("Failed to persist decay freeze state")
+        return JSONResponse({"error": "freeze state write failed"}, status_code=500)
+
+
 @mcp.custom_route("/api/buckets", methods=["GET"])
 async def api_buckets(request):
     """List all buckets with metadata (no content for efficiency)."""
@@ -1704,7 +1756,7 @@ async def api_bucket_update(request):
     if not updates:
         return JSONResponse({"error": "no fields to update"}, status_code=400)
 
-    success = await bucket_mgr.update(bucket_id, **updates)
+    success = await bucket_mgr.update(bucket_id, touch=False, **updates)
     if not success:
         return JSONResponse({"error": "update failed"}, status_code=500)
 
@@ -1714,7 +1766,11 @@ async def api_bucket_update(request):
         except Exception:
             pass
 
-    return JSONResponse({"ok": True, "updated": list(updates.keys())})
+    return JSONResponse({
+        "ok": True,
+        "updated": list(updates.keys()),
+        "activation_preserved": True,
+    })
 
 
 @mcp.custom_route("/api/search", methods=["GET"])
@@ -2513,11 +2569,11 @@ async def api_import_review(request):
             continue
         try:
             if action == "important":
-                await bucket_mgr.update(bid, importance=9)
+                await bucket_mgr.update(bid, touch=False, importance=9)
             elif action == "pin":
-                await bucket_mgr.update(bid, pinned=True)
+                await bucket_mgr.update(bid, touch=False, pinned=True)
             elif action == "noise":
-                await bucket_mgr.update(bid, resolved=True, importance=1)
+                await bucket_mgr.update(bid, touch=False, resolved=True, importance=1)
             elif action == "delete":
                 file_path = bucket_mgr._find_bucket_file(bid)
                 if file_path:

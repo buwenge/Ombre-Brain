@@ -312,7 +312,7 @@ breath(query="今天很累")
 
 | 工具 Tool | 作用 Purpose |
 |-----------|-------------|
-| `breath` | 浮现或检索记忆。无参数=推送未解决记忆；有参数=关键词+向量语义双通道检索。支持 domain/valence/arousal 过滤 / Surface or search memories. No args = surface unresolved; with query = keyword + vector dual-channel search. Supports domain/valence/arousal filters |
+| `breath` | 浮现或检索记忆。无参数=推送钉选准则和排除 dream 最新 10 条后的高权重未解决记忆；有参数=关键词+向量语义双通道检索。支持 domain/valence/arousal 过滤 / Surface or search memories. No args = surface pinned and high-weight unresolved memories not reserved for dream; with query = keyword + vector dual-channel search. Supports domain/valence/arousal filters |
 | `hold` | 存储单条记忆，自动打标+合并相似桶+生成 embedding。`feel=True` 写模型自己的感受 / Store a single memory with auto-tagging, merging, and embedding. `feel=True` for model's own reflections |
 | `grow` | 日记归档，自动拆分长内容为多个记忆桶，每个桶自动生成 embedding / Diary digest, auto-split into multiple buckets with embeddings |
 | `trace` | 修改元数据、标记已解决、删除 / Modify metadata, mark resolved, delete |
@@ -461,17 +461,22 @@ Full env var reference: [ENV_VARS.md](ENV_VARS.md).
 
 $$final\_score = Importance \times activation\_count^{0.3} \times e^{-\lambda \times days} \times combined\_weight \times resolved\_factor \times urgency\_boost$$
 
-### 短期/长期权重分离 / Short-term vs Long-term Weight Separation
+### 新鲜度与情感权重连续交接 / Continuous Freshness-to-Emotion Handoff
 
-系统对记忆的权重计算采用**分段策略**，模拟人类记忆的时效特征：
-The system uses a **segmented weighting strategy** that mimics how human memory prioritizes:
+刚激活时由新鲜度主导，随后连续地把主导权交给情感强度；距离长期配比的差距每 3 天减半，不再在第三天硬切换。
+Freshly activated memories are freshness-led, then continuously hand off to emotional intensity. The remaining distance to the long-term mix halves every three days, with no day-three cliff.
 
-| 阶段 Phase | 时间范围 | 权重分配 | 直觉解释 |
-|---|---|---|---|
-| 短期 Short-term | ≤ 3 天 | 时间 70% + 情感 30% | 刚发生的事，鲜活度最重要 |
-| 长期 Long-term | > 3 天 | 情感 70% + 时间 30% | 时间淡了，情感强度决定能记多久 |
+| 关系时间 Relationship time | 时间权重 Time | 情感权重 Emotion |
+|---|---:|---:|
+| 刚激活 / Just activated | 70% | 30% |
+| 3 天 / 3 days | 50% | 50% |
+| 6 天 / 6 days | 40% | 60% |
+| 12 天 / 12 days | 32.5% | 67.5% |
+| 长期极限 / Long-term limit | 30% | 70% |
 
-$$combined\_weight = \begin{cases} time\_weight \times 0.7 + emotion\_weight \times 0.3 & \text{if } days \leq 3 \\ emotion\_weight \times 0.7 + time\_weight \times 0.3 & \text{if } days > 3 \end{cases}$$
+$$emotion\_share = 0.7 - 0.4 \times 2^{-days/3}, \quad time\_share = 1-emotion\_share$$
+
+$$combined\_weight = time\_weight \times time\_share + emotion\_weight \times emotion\_share$$
 
 ### 时间系数（新鲜度加成）/ Time Weight (Freshness Bonus)
 
@@ -516,10 +521,20 @@ $$emotion\_weight = base + arousal \times arousal\_boost$$
 - `arousal`: 唤醒度，越强烈的记忆越难忘 / arousal; intense memories are harder to forget
 - `λ` (decay_lambda): 衰减速率，默认 0.05 / decay rate, default 0.05
 
+### 关系时钟冻结 / Relationship Clock Freeze
+
+Dashboard 顶栏的“冻结衰减”用于暂别：冻结区间不会计入任何桶的 `days`，也不会触发低重要度记忆的 30 天自动结案。状态保存在桶 Volume 根目录的 `.decay_freeze.json`，服务重启后仍有效。
+
+The Dashboard “Freeze decay” button pauses relationship time: frozen intervals are excluded from every bucket's `days` and from the 30-day auto-resolve clock. State persists in `.decay_freeze.json` beside the bucket directories and survives restarts.
+
+下一次正常 Breath 会在排名前自动解冻；直接搜索、按 ID 读取或成功浮现导致的 `touch`/`soft_touch` 也会解冻。Dashboard 纠错、补标、自动结案和历史导入等 `touch=False` 维护操作不会解冻。
+
+The next normal Breath resumes the clock before ranking. Direct recall and successful `touch`/`soft_touch` activation also resume it, while `touch=False` maintenance does not.
+
 ## Dreaming 与 Feel / Dreaming & Feel
 
 ### Dreaming — 做梦
-每次新对话开始时，Claude 会自动执行 `dream()`——读取最近的记忆桶，用第一人称思考：哪些事还有重量？哪些可以放下了？
+每次新对话开始时，Claude 会自动执行 `dream()`——读取预留的最近 10 条记忆桶（同次无参 breath 会排除它们），用第一人称思考：哪些事还有重量？哪些可以放下了？
 
 At the start of each conversation, Claude runs `dream()` — reads recent memory buckets and reflects in first person: what still carries weight? What can be let go?
 

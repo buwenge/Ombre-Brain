@@ -653,6 +653,7 @@ class ImportEngine:
                     old_a = bucket["metadata"].get("arousal", 0.3)
                     await self.bucket_mgr.update(
                         bucket["id"],
+                        touch=False,
                         content=merged,
                         tags=list(set(bucket["metadata"].get("tags", []) + tags)),
                         importance=max(bucket["metadata"].get("importance", 5), importance),
