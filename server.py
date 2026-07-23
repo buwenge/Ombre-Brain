@@ -2541,6 +2541,284 @@ async def api_breath_debug(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# =============================================================
+# /api/simulate/* — non-activating wake-flow simulation for the
+# dashboard. Mirrors breath()/dream()'s real selection logic so the
+# user can see exactly what would surface right now, without ever
+# calling touch()/soft_touch() (no activation side effects).
+# 唤醒流程模拟：照抄 breath()/dream() 的真实选桶逻辑，但绝不调用
+# touch/soft_touch，纯粹用于核对权重、不影响记忆的激活状态。
+# =============================================================
+
+def _sim_row(bucket: dict, score: float, **extra) -> dict:
+    meta = bucket.get("metadata", {})
+    return {
+        "id": bucket["id"],
+        "name": meta.get("name", bucket["id"]),
+        "type": meta.get("type", "dynamic"),
+        "domain": meta.get("domain", []),
+        "score": round(score, 4) if score is not None else None,
+        "content_preview": strip_wikilinks(bucket.get("content", ""))[:200],
+        **extra,
+    }
+
+
+@mcp.custom_route("/api/simulate/breath", methods=["GET"])
+async def api_simulate_breath(request):
+    """Dry-run of breath()'s no-query surfacing mode (line ~838 in breath())."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        max_results = min(int(request.query_params.get("max_results", 20)), 50)
+        max_tokens = min(int(request.query_params.get("max_tokens", 10000)), 20000)
+    except (TypeError, ValueError):
+        max_results, max_tokens = 20, 10000
+
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    ranked_all, weight_ranks, score_snapshot = _weight_rank_snapshot(all_buckets)
+    dream_recent = _select_dream_recent(all_buckets)
+    dream_ids = {b["id"] for b in dream_recent}
+
+    def score_of(b):
+        return score_snapshot.get(b["id"], decay_engine.calculate_score(b["metadata"]))
+
+    pinned_buckets = [
+        b for b in all_buckets
+        if b["metadata"].get("pinned") or b["metadata"].get("protected")
+    ]
+    pinned_ids = {b["id"] for b in pinned_buckets}
+
+    unresolved = [
+        b for b in all_buckets
+        if not b["metadata"].get("resolved", False)
+        and b["metadata"].get("type") not in ("permanent", "feel", "letter", "crave")
+        and not b["metadata"].get("pinned", False)
+        and not b["metadata"].get("protected", False)
+        and b["id"] not in dream_ids
+    ]
+    unresolved_ids = {b["id"] for b in unresolved}
+
+    surfaced = []
+    not_surfaced = []
+
+    # --- pinned/protected: always surface, real dehydrate (matches production) ---
+    token_budget = max_tokens
+    for b in pinned_buckets:
+        try:
+            clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+            summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+            token_budget -= count_tokens_approx(summary)
+            surfaced.append(_sim_row(b, score_of(b), channel="pin", summary=summary))
+        except Exception as e:
+            not_surfaced.append(_sim_row(b, score_of(b), reason="dehydrate_error", detail=str(e)))
+
+    # --- everything else that isn't in `unresolved`: classify why it's excluded ---
+    for b in all_buckets:
+        bid = b["id"]
+        if bid in pinned_ids or bid in unresolved_ids:
+            continue
+        meta = b["metadata"]
+        if bid in dream_ids:
+            not_surfaced.append(_sim_row(b, score_of(b), reason="reserved_for_dream"))
+        elif meta.get("type") in ("permanent", "feel", "letter", "crave"):
+            not_surfaced.append(_sim_row(b, score_of(b), reason="excluded_type"))
+        elif meta.get("resolved", False):
+            not_surfaced.append(_sim_row(b, score_of(b), reason="resolved"))
+
+    # --- cold-start + weight ranking + diversity shuffle, exactly as breath() ---
+    scored = sorted(unresolved, key=lambda b: score_snapshot[b["id"]], reverse=True)
+    cold_start = [
+        b for b in unresolved
+        if int(b["metadata"].get("activation_count", 0)) == 0
+        and int(b["metadata"].get("importance", 0)) >= 8
+    ][:2]
+    cold_start_ids = {b["id"] for b in cold_start}
+    scored_deduped = [b for b in scored if b["id"] not in cold_start_ids]
+    candidates = cold_start + scored_deduped
+
+    if len(candidates) > 1:
+        n_cold = len(cold_start)
+        non_cold = candidates[n_cold:]
+        if len(non_cold) > 1:
+            top1 = [non_cold[0]]
+            pool = non_cold[1:min(20, len(non_cold))]
+            random.shuffle(pool)
+            non_cold = top1 + pool + non_cold[min(20, len(non_cold)):]
+        candidates = cold_start + non_cold
+
+    chosen = candidates[:max_results]
+    beyond_cap = candidates[max_results:]
+    for b in beyond_cap:
+        not_surfaced.append(_sim_row(b, score_of(b), reason="beyond_max_results"))
+
+    stopped = False
+    for b in chosen:
+        if stopped:
+            not_surfaced.append(_sim_row(b, score_of(b), reason="token_exhausted"))
+            continue
+        if token_budget <= 0:
+            not_surfaced.append(_sim_row(b, score_of(b), reason="token_exhausted"))
+            stopped = True
+            continue
+        try:
+            clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+            summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+            summary_tokens = count_tokens_approx(summary)
+            if summary_tokens > token_budget:
+                not_surfaced.append(_sim_row(b, score_of(b), reason="summary_exceeds_budget"))
+                stopped = True
+                continue
+            token_budget -= summary_tokens
+            channel = "cold_start" if b["id"] in cold_start_ids else "dynamic"
+            surfaced.append(_sim_row(b, score_of(b), channel=channel, summary=summary))
+        except Exception as e:
+            not_surfaced.append(_sim_row(b, score_of(b), reason="dehydrate_error", detail=str(e)))
+
+    not_surfaced.sort(key=lambda r: r["score"] if r["score"] is not None else -1, reverse=True)
+    return JSONResponse({
+        "mode": "breath",
+        "total_buckets": len(all_buckets),
+        "surfaced": surfaced,
+        "not_surfaced": not_surfaced,
+    })
+
+
+@mcp.custom_route("/api/simulate/dream", methods=["GET"])
+async def api_simulate_dream(request):
+    """Dry-run of dream() (line ~1644) — it never touches buckets in production either."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    _ranked_all, weight_ranks, score_snapshot = _weight_rank_snapshot(all_buckets)
+    recent = _select_dream_recent(all_buckets)
+    recent_ids = {b["id"] for b in recent}
+
+    def score_of(b):
+        return score_snapshot.get(b["id"], decay_engine.calculate_score(b["metadata"]))
+
+    surfaced = [
+        _sim_row(b, score_of(b), channel="dream", content_preview=strip_wikilinks(b.get("content", ""))[:500])
+        for b in recent
+    ]
+    not_surfaced = []
+    for b in all_buckets:
+        if b["id"] in recent_ids:
+            continue
+        meta = b["metadata"]
+        if meta.get("pinned") or meta.get("protected"):
+            not_surfaced.append(_sim_row(b, score_of(b), reason="pinned_excluded"))
+        elif meta.get("type") in ("permanent", "feel", "letter", "crave"):
+            not_surfaced.append(_sim_row(b, score_of(b), reason="excluded_type"))
+        else:
+            not_surfaced.append(_sim_row(b, score_of(b), reason="not_recent_enough"))
+
+    not_surfaced.sort(key=lambda r: r["score"] if r["score"] is not None else -1, reverse=True)
+    return JSONResponse({
+        "mode": "dream",
+        "total_buckets": len(all_buckets),
+        "surfaced": surfaced,
+        "not_surfaced": not_surfaced,
+    })
+
+
+@mcp.custom_route("/api/simulate/feel", methods=["GET"])
+async def api_simulate_feel(request):
+    """Dry-run of breath(domain='feel') (line ~741) — never dehydrates or touches."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
+    feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+    top10, rest = feels[:10], feels[10:]
+
+    surfaced = [
+        _sim_row(b, None, channel="feel", created=b["metadata"].get("created", ""),
+                 content_preview=strip_wikilinks(b.get("content", ""))[:500])
+        for b in top10
+    ]
+    not_surfaced = [
+        _sim_row(b, None, reason="beyond_top10", created=b["metadata"].get("created", ""))
+        for b in rest
+    ]
+    return JSONResponse({
+        "mode": "feel",
+        "total_buckets": len(all_buckets),
+        "surfaced": surfaced,
+        "not_surfaced": not_surfaced,
+    })
+
+
+@mcp.custom_route("/api/simulate/crave", methods=["GET"])
+async def api_simulate_crave(request):
+    """Dry-run of breath(domain='crave') (line ~787) — never dehydrates or touches."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    craves = [b for b in all_buckets if b["metadata"].get("type") == "crave"]
+    active = [b for b in craves if not b["metadata"].get("digested", False)]
+    digested = [b for b in craves if b["metadata"].get("digested", False)]
+    active.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+    top10, rest = active[:10], active[10:]
+
+    surfaced = [
+        _sim_row(b, None, channel="crave", created=b["metadata"].get("created", ""),
+                 content_preview=strip_wikilinks(b.get("content", ""))[:500])
+        for b in top10
+    ]
+    not_surfaced = [
+        _sim_row(b, None, reason="beyond_top10", created=b["metadata"].get("created", ""))
+        for b in rest
+    ] + [
+        _sim_row(b, None, reason="digested", created=b["metadata"].get("created", ""))
+        for b in digested
+    ]
+    return JSONResponse({
+        "mode": "crave",
+        "total_buckets": len(all_buckets),
+        "surfaced": surfaced,
+        "not_surfaced": not_surfaced,
+    })
+
+
+@mcp.custom_route("/api/dehydrate-preview/{bucket_id}", methods=["GET"])
+async def api_dehydrate_preview(request):
+    """On-demand dehydration preview for a single bucket. Read-only: dehydrate()
+    only touches its own SQLite cache, never bucket metadata / activation state."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    try:
+        clean_meta = {k: v for k, v in bucket["metadata"].items() if k != "tags"}
+        summary = await dehydrator.dehydrate(strip_wikilinks(bucket["content"]), clean_meta)
+        return JSONResponse({"id": bucket_id, "summary": summary})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @mcp.custom_route("/dashboard", methods=["GET"])
 async def dashboard(request):
     """Serve the dashboard HTML page."""

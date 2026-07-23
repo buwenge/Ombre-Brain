@@ -550,6 +550,53 @@
   .score-pass { color: var(--positive); }
   .score-fail { color: var(--text-light); }
 
+  .wake-mode-btn { opacity: 0.55; }
+  .wake-mode-btn.active { opacity: 1; }
+  .wake-section-title {
+    font-size: 13px;
+    font-weight: 600;
+    margin: 20px 0 8px;
+    color: var(--text);
+  }
+  .wake-section-title.dim { color: var(--text-dim); }
+  .wake-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-radius: 12px;
+    font-size: 13px;
+    cursor: pointer;
+    margin-bottom: 4px;
+    transition: all 0.2s ease;
+  }
+  .wake-row:hover { background: var(--surface); }
+  .wake-row.not-surfaced { opacity: 0.5; }
+  .wake-row.not-surfaced:hover { opacity: 0.85; }
+  .wake-row .wake-name { font-weight: 500; flex-shrink: 0; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wake-row .wake-score { font-size: 12px; color: var(--text-dim); flex-shrink: 0; width: 60px; }
+  .wake-row .wake-reason { font-size: 11px; color: var(--text-light); flex-shrink: 0; }
+  .wake-row .wake-summary { font-size: 12px; color: var(--text-dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wake-preview-btn {
+    font-size: 11px;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 3px 10px;
+    cursor: pointer;
+    color: var(--accent);
+    flex-shrink: 0;
+  }
+  .wake-preview-box {
+    font-size: 12px;
+    color: var(--text-dim);
+    background: var(--surface);
+    border-radius: 10px;
+    padding: 10px 14px;
+    margin: -2px 0 6px 24px;
+    white-space: pre-wrap;
+  }
+
   .breath-flow {
     display: flex;
     align-items: center;
@@ -614,6 +661,7 @@
 <div class="tabs">
   <div class="tab active" data-tab="list">记忆桶</div>
   <div class="tab" data-tab="breath">Breath 模拟</div>
+  <div class="tab" data-tab="wake">唤醒流程模拟</div>
   <div class="tab" data-tab="network">记忆网络</div>
   <div class="tab" data-tab="config">配置</div>
   <div class="tab" data-tab="import">导入</div>
@@ -653,6 +701,22 @@
   <div class="breath-info" id="breath-info" style="display:none"></div>
   <div id="breath-results">
     <div class="loading">输入 query 后点击「模拟 Breath」查看评分链路</div>
+  </div>
+</div>
+
+<div class="content" id="wake-view" style="display:none">
+  <p style="color:var(--text-dim);font-size:13px;margin-bottom:12px;">
+    完全模拟小予真实唤醒步骤会调用的通道——不传 query 的 breath（浮现）、dream、breath(domain="feel")、breath(domain="crave")。
+    只读模拟，全程不调用 touch/soft_touch，不影响任何桶的激活次数。点击任意一行可查看详情并编辑。
+  </p>
+  <div class="breath-controls" style="margin-bottom:16px;">
+    <button class="wake-mode-btn active" data-mode="breath" onclick="runWakeSimulate('breath')">Breath 浮现</button>
+    <button class="wake-mode-btn" data-mode="dream" onclick="runWakeSimulate('dream')">Dream</button>
+    <button class="wake-mode-btn" data-mode="feel" onclick="runWakeSimulate('feel')">Feel</button>
+    <button class="wake-mode-btn" data-mode="crave" onclick="runWakeSimulate('crave')">Crave</button>
+  </div>
+  <div id="wake-results">
+    <div class="loading">点击上方按钮模拟对应的唤醒步骤</div>
   </div>
 </div>
 
@@ -1089,6 +1153,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     const target = tab.dataset.tab;
     document.getElementById('list-view').style.display = target === 'list' ? '' : 'none';
     document.getElementById('breath-view').style.display = target === 'breath' ? '' : 'none';
+    document.getElementById('wake-view').style.display = target === 'wake' ? '' : 'none';
     document.getElementById('network-view').style.display = target === 'network' ? '' : 'none';
     document.getElementById('config-view').style.display = target === 'config' ? '' : 'none';
     document.getElementById('import-view').style.display = target === 'import' ? '' : 'none';
@@ -1572,7 +1637,7 @@ async function runBreathDebug() {
         '</div>';
       }).join('');
 
-      return '<div class="score-row" title="' + esc(r.name) + '">' +
+      return '<div class="score-row" style="cursor:pointer" title="' + esc(r.name) + '" onclick="showDetail(\'' + r.id + '\')">' +
         '<span class="rank">' + (i < 9 ? '0' : '') + (i + 1) + '</span>' +
         '<span class="name">' + icon + ' ' + esc(r.name) + '</span>' +
         '<div class="score-bars">' + bars + '</div>' +
@@ -1587,6 +1652,72 @@ async function runBreathDebug() {
 document.getElementById('breath-query').addEventListener('keydown', function(e) {
   if (e.key === 'Enter') runBreathDebug();
 });
+
+var wakeIcons = { pin: '📌', cold_start: '🌱', dynamic: '💭', dream: '💤', feel: '🫧', crave: '🔥' };
+var wakeReasonLabels = {
+  reserved_for_dream: '被 Dream 预留', excluded_type: '类型不参与浮现', resolved: '已解决',
+  beyond_max_results: '排名靠后未入选', token_exhausted: 'token 预算耗尽',
+  summary_exceeds_budget: '脱水后超出预算', dehydrate_error: '脱水失败',
+  pinned_excluded: '钉选桶不参与Dream', not_recent_enough: '不够新',
+  beyond_top10: '排在前10之外', digested: '已标记 digested',
+};
+
+async function runWakeSimulate(mode) {
+  document.querySelectorAll('.wake-mode-btn').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.mode === mode);
+  });
+  var container = document.getElementById('wake-results');
+  container.innerHTML = '<div class="loading">模拟中…</div>';
+  try {
+    var res = await fetch(BASE + '/api/simulate/' + mode);
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+
+    function renderRow(r, surfaced) {
+      var icon = wakeIcons[r.channel] || '·';
+      var scoreText = r.score != null ? r.score.toFixed(2) : '';
+      var right = surfaced
+        ? '<span class="wake-summary" title="' + esc(r.summary || r.content_preview || '') + '">' + esc(r.summary || r.content_preview || '') + '</span>'
+        : '<span class="wake-reason">' + (wakeReasonLabels[r.reason] || r.reason || '') + '</span>' +
+          (mode === 'breath' ? '<button class="wake-preview-btn" onclick="event.stopPropagation();previewDehydrate(\'' + r.id + '\', this)">👁 预览脱水</button>' : '');
+      return '<div class="wake-row' + (surfaced ? '' : ' not-surfaced') + '" onclick="showDetail(\'' + r.id + '\')">' +
+        '<span>' + icon + '</span>' +
+        '<span class="wake-name" title="' + esc(r.name) + '">' + esc(r.name) + '</span>' +
+        '<span class="wake-score">' + scoreText + '</span>' +
+        right +
+      '</div><div id="wake-preview-' + r.id + '"></div>';
+    }
+
+    var html = '';
+    html += '<div class="wake-section-title">✅ 会浮现 (' + data.surfaced.length + ')</div>';
+    html += data.surfaced.length
+      ? data.surfaced.map(function(r) { return renderRow(r, true); }).join('')
+      : '<div class="loading">没有会浮现的桶</div>';
+    html += '<div class="wake-section-title dim">— 不会浮现 (' + data.not_surfaced.length + ')</div>';
+    html += data.not_surfaced.length
+      ? data.not_surfaced.map(function(r) { return renderRow(r, false); }).join('')
+      : '<div class="loading">没有被排除的桶</div>';
+    container.innerHTML = html;
+  } catch (e) {
+    container.innerHTML = '<div class="loading">请求失败: ' + e.message + '</div>';
+  }
+}
+
+async function previewDehydrate(id, btn) {
+  var box = document.getElementById('wake-preview-' + id);
+  btn.disabled = true;
+  btn.textContent = '加载中…';
+  try {
+    var res = await fetch(BASE + '/api/dehydrate-preview/' + id);
+    var data = await res.json();
+    box.innerHTML = '<div class="wake-preview-box">' + esc(data.summary || data.error || '') + '</div>';
+    btn.textContent = '👁 已预览';
+  } catch (e) {
+    box.innerHTML = '<div class="wake-preview-box">预览失败: ' + esc(e.message) + '</div>';
+    btn.disabled = false;
+    btn.textContent = '👁 预览脱水';
+  }
+}
 
 async function loadConfig() {
   try {
@@ -1743,6 +1874,7 @@ async function loadImportResults() {
         <p style="font-size:13px;margin:6px 0;white-space:pre-wrap;">${b.content}</p>
         <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;">${(b.tags||[]).map(t=>'#'+t).join(' ')}</div>
         <div style="display:flex;gap:8px;">
+          <button onclick="showDetail('${b.id}')" title="查看完整内容并编辑">👁 查看/编辑</button>
           <button onclick="reviewAction('${b.id}','pin')" title="固定为永久记忆">📌 固定</button>
           <button onclick="reviewAction('${b.id}','important')" title="标为重要">⭐ 重要</button>
           <button onclick="reviewAction('${b.id}','noise')" title="标为噪声并resolve">🗑 噪声</button>
