@@ -1292,6 +1292,7 @@ async function showDetail(id) {
         '<button class="btn-primary" style="padding:8px 16px;font-size:12px;" onclick="toggleEditMode(\'' + id + '\')">✏️ 编辑</button>' +
         '<button style="padding:8px 16px;font-size:12px;background:none;border:1px solid var(--border);border-radius:20px;cursor:pointer;color:var(--accent);" onclick="quickAction(\'' + id + '\',\'pin\',' + (meta.pinned ? 'false' : 'true') + ')">' + (meta.pinned ? '📌 取消钉选' : '📌 钉选') + '</button>' +
         '<button style="padding:8px 16px;font-size:12px;background:none;border:1px solid var(--border);border-radius:20px;cursor:pointer;color:var(--accent);" onclick="quickAction(\'' + id + '\',\'resolve\',' + (meta.resolved ? 'false' : 'true') + ')">' + (meta.resolved ? '⚡ 重新激活' : '💤 沉底') + '</button>' +
+        '<button style="padding:8px 16px;font-size:12px;background:none;border:1px solid var(--border);border-radius:20px;cursor:pointer;color:var(--accent);" onclick="quickAction(\'' + id + '\',\'digest\',' + (meta.digested ? 'false' : 'true') + ')">' + (meta.digested ? '🌿 取消已消化' : '🌿 标记已消化') + '</button>' +
         '<button style="padding:8px 16px;font-size:12px;background:none;border:1px solid var(--border);border-radius:20px;cursor:pointer;color:var(--negative);" onclick="if(confirm(\'确定删除该记忆桶？此操作不可撤销。\'))deleteBucket(\'' + id + '\')">✕ 删除</button>' +
       '</div>' +
       '<div style="margin-bottom:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">' +
@@ -1434,6 +1435,7 @@ async function quickAction(id, action, value) {
   var body = {};
   if (action === 'pin') body.pinned = value;
   if (action === 'resolve') body.resolved = value;
+  if (action === 'digest') body.digested = value;
   try {
     var res = await fetch(BASE + '/api/bucket/' + id, {
       method: 'POST',
