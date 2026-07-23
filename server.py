@@ -2025,11 +2025,15 @@ async def api_bucket_detail(request):
     if not bucket:
         return JSONResponse({"error": "not found"}, status_code=404)
     meta = bucket.get("metadata", {})
+    content = strip_wikilinks(bucket.get("content", ""))
+    edited_hash = meta.get("dehydration_edited_hash")
+    dehydration_stale = bool(edited_hash) and edited_hash != hashlib.sha256(content.encode()).hexdigest()
     return JSONResponse({
         "id": bucket["id"],
         "metadata": meta,
-        "content": strip_wikilinks(bucket.get("content", "")),
+        "content": content,
         "score": decay_engine.calculate_score(meta),
+        "dehydration_stale": dehydration_stale,
     })
 
 
@@ -2094,6 +2098,8 @@ async def api_bucket_update(request):
         updates["dehydration_mode"] = body["dehydration_mode"]
     if "verbatim" in body:
         updates["verbatim"] = bool(body["verbatim"])
+    if "dehydration_edited_hash" in body:
+        updates["dehydration_edited_hash"] = str(body["dehydration_edited_hash"] or "")
     if "content" in body and body["content"]:
         updates["content"] = body["content"]
 
@@ -2859,6 +2865,35 @@ async def api_dehydrate_preview(request):
         return JSONResponse({"id": bucket_id, "summary": summary})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/dehydrate-preview/{bucket_id}", methods=["POST"])
+async def api_dehydrate_preview_save(request):
+    """Save a hand-edited dehydration draft (core_facts + summary), overwriting
+    whatever the LLM produced in the cache. Pins the edit to the bucket's current
+    content hash — if the raw content is edited afterward the hash won't match
+    and GET /api/bucket/{id} will report dehydration_stale=true so the dashboard
+    can warn instead of silently discarding the manual edit."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    core_facts = body.get("core_facts")
+    summary = body.get("summary")
+    if not isinstance(core_facts, list) or not isinstance(summary, str) or not summary.strip():
+        return JSONResponse({"error": "core_facts (list) and summary (non-empty string) required"}, status_code=400)
+    content = strip_wikilinks(bucket["content"])
+    parsed = {"core_facts": [str(f) for f in core_facts], "summary": summary.strip()}
+    content_hash = dehydrator.set_manual_summary(content, parsed)
+    await bucket_mgr.update(bucket_id, touch=False, dehydration_edited_hash=content_hash)
+    return JSONResponse({"ok": True})
 
 
 @mcp.custom_route("/dashboard", methods=["GET"])

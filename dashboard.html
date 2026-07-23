@@ -1288,6 +1288,11 @@ async function showDetail(id) {
     var meta = b.metadata || {};
     content.innerHTML =
       '<h2>' + esc(meta.name || id) + '</h2>' +
+      (b.dehydration_stale ?
+        '<div style="background:var(--negative-bg,rgba(220,80,80,.12));border:1px solid var(--negative);border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:12px;display:flex;justify-content:space-between;align-items:center;gap:10px;">' +
+          '<span>⚠️ 这条脱水稿被手动改过，但正文后来又变了，改动可能已经对不上——要不要重新看一眼、决定要不要重改</span>' +
+          '<button style="padding:6px 12px;font-size:12px;background:none;border:1px solid var(--border);border-radius:20px;cursor:pointer;white-space:nowrap;" onclick="clearDehydrationStale(\'' + id + '\')">知道了，清除标记</button>' +
+        '</div>' : '') +
       '<div style="display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap;">' +
         '<button class="btn-primary" style="padding:8px 16px;font-size:12px;" onclick="toggleEditMode(\'' + id + '\')">✏️ 编辑</button>' +
         '<button style="padding:8px 16px;font-size:12px;background:none;border:1px solid var(--border);border-radius:20px;cursor:pointer;color:var(--accent);" onclick="quickAction(\'' + id + '\',\'pin\',' + (meta.pinned ? 'false' : 'true') + ')">' + (meta.pinned ? '📌 取消钉选' : '📌 钉选') + '</button>' +
@@ -1402,12 +1407,45 @@ async function previewDehydrateCompare(id) {
       return '<div style="margin-top:8px;"><b style="font-size:12px;">' + label + (isAuto ? ' · 自动模式会选这个' : '') + '</b>' +
         '<div class="wake-preview-box" style="margin-left:0;">' + esc(text) + '</div></div>';
     }
+    var facts = (data.raw && data.raw.core_facts) || [];
+    var summaryText = (data.raw && data.raw.summary) || '';
     box.innerHTML =
       '<div style="font-size:11px;color:var(--text-dim);margin-top:4px;">' + (data.from_cache ? '（命中缓存，未产生新的 API 调用）' : '（刚发生一次真实脱水 API 调用）') + '</div>' +
       block('仅摘要', data.variants.summary, data.auto_picks === 'summary') +
-      block('仅事实清单', data.variants.facts, data.auto_picks === 'facts');
+      block('仅事实清单', data.variants.facts, data.auto_picks === 'facts') +
+      '<div style="margin-top:14px;border-top:1px solid var(--border);padding-top:10px;">' +
+        '<b style="font-size:12px;">手动改脱水稿</b>' +
+        '<div style="font-size:11px;color:var(--text-dim);margin:4px 0 8px;">改这里不会重新调用 API，直接覆盖缓存；只要正文不变，改动会一直生效</div>' +
+        '<label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">事实清单（每行一条）</label>' +
+        '<textarea id="manual-facts-' + id + '" style="width:100%;min-height:100px;padding:8px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:12px;line-height:1.6;resize:vertical;font-family:inherit;">' + esc(facts.join('\n')) + '</textarea>' +
+        '<label style="font-size:11px;color:var(--text-light);display:block;margin:8px 0 3px;">摘要（一句话）</label>' +
+        '<textarea id="manual-summary-' + id + '" style="width:100%;min-height:50px;padding:8px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:12px;line-height:1.6;resize:vertical;font-family:inherit;">' + esc(summaryText) + '</textarea>' +
+        '<button class="btn-primary" style="padding:8px 18px;font-size:12px;margin-top:8px;" onclick="saveManualDehydration(\'' + id + '\')">保存手动修改</button>' +
+      '</div>';
   } catch (e) {
     box.innerHTML = '<div class="wake-preview-box">预览失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function saveManualDehydration(id) {
+  var box = document.getElementById('dehydrate-compare-' + id);
+  var facts = document.getElementById('manual-facts-' + id).value.split('\n').map(function(s){return s.trim();}).filter(Boolean);
+  var summary = document.getElementById('manual-summary-' + id).value.trim();
+  if (!summary) { alert('摘要不能为空'); return; }
+  try {
+    var res = await fetch(BASE + '/api/dehydrate-preview/' + id, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ core_facts: facts, summary: summary }),
+    });
+    var data = await res.json();
+    if (data.ok) {
+      previewDehydrateCompare(id);
+    } else {
+      alert('保存失败: ' + (data.error || ''));
+    }
+  } catch (e) {
+    alert('请求失败: ' + e.message);
   }
 }
 
@@ -1424,6 +1462,26 @@ async function setDehydrationMode(id, mode) {
     statusEl.innerHTML = data.ok
       ? '<span style="color:var(--positive);">✓ 呈现格式已保存（未激活记忆）</span>'
       : '<span style="color:var(--negative);">✗ ' + (data.error || '保存失败') + '</span>';
+  } catch (e) {
+    statusEl.innerHTML = '<span style="color:var(--negative);">✗ 请求失败: ' + e.message + '</span>';
+  }
+}
+
+async function clearDehydrationStale(id) {
+  var statusEl = document.getElementById('detail-status');
+  statusEl.innerHTML = '<span style="color:var(--text-dim);">清除中…</span>';
+  try {
+    var res = await fetch(BASE + '/api/bucket/' + id, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ dehydration_edited_hash: '' }),
+    });
+    var data = await res.json();
+    if (data.ok) {
+      showDetail(id);
+    } else {
+      statusEl.innerHTML = '<span style="color:var(--negative);">✗ ' + (data.error || '清除失败') + '</span>';
+    }
   } catch (e) {
     statusEl.innerHTML = '<span style="color:var(--negative);">✗ 请求失败: ' + e.message + '</span>';
   }

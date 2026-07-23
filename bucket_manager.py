@@ -325,6 +325,9 @@ class BucketManager:
             post["dehydration_mode"] = kwargs["dehydration_mode"]
         if "verbatim" in kwargs:
             post["verbatim"] = bool(kwargs["verbatim"])
+        if "dehydration_edited_hash" in kwargs:
+            # Empty string clears the marker (user dismissed the stale warning)
+            post["dehydration_edited_hash"] = str(kwargs["dehydration_edited_hash"] or "")
         if "model_valence" in kwargs:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
         # --- letter 元数据字段（署名/称呼/标题/信件日期），原样透传 ---

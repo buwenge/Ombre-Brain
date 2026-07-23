@@ -244,6 +244,15 @@ class Dehydrator:
         conn.commit()
         conn.close()
 
+    def set_manual_summary(self, content: str, parsed: dict) -> str:
+        """Overwrite the cached dehydration for this content with a manually
+        edited core_facts/summary, replacing whatever the LLM produced.
+        Returns the content hash the edit is pinned to — callers store this
+        on the bucket to detect drift if the raw content changes later."""
+        raw_text = json.dumps(parsed, ensure_ascii=False)
+        self._set_cached_summary(content, raw_text)
+        return hashlib.sha256(content.encode()).hexdigest()
+
     def invalidate_cache(self, content: str):
         """Remove cached summary for specific content (call when bucket content changes)."""
         content_hash = hashlib.sha256(content.encode()).hexdigest()
