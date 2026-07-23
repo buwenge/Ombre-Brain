@@ -413,8 +413,11 @@ class Dehydrator:
     # ---------------------------------------------------------
     # Output formatting
     # 输出格式化
-    # Wraps dehydrated result with bucket name/domain header
-    # 把脱水结果包装成带桶名、主题域的可读文本
+    # Wraps dehydrated result with just the bucket name — domain/tags
+    # duplicate metadata already visible elsewhere and don't help the
+    # reading model, so the header stays name-only (+ digested marker).
+    # 把脱水结果包装成只带桶名的可读文本——主题域跟其他地方的元数据重复，
+    # 对阅读理解没有增量，头部只留桶名（+已消化标记）。
     # ---------------------------------------------------------
     def _format_output(self, content: str, metadata: dict = None) -> str:
         """
@@ -424,10 +427,7 @@ class Dehydrator:
         header = ""
         if metadata and isinstance(metadata, dict):
             name = metadata.get("name", "未命名")
-            domains = ", ".join(metadata.get("domain", []))
             header = f"📌 记忆桶: {name}"
-            if domains:
-                header += f" [主题:{domains}]"
             if metadata.get("digested"):
                 header += " [已消化]"
             header += "\n"

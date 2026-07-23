@@ -1294,6 +1294,16 @@ async function showDetail(id) {
         '<button style="padding:8px 16px;font-size:12px;background:none;border:1px solid var(--border);border-radius:20px;cursor:pointer;color:var(--accent);" onclick="quickAction(\'' + id + '\',\'resolve\',' + (meta.resolved ? 'false' : 'true') + ')">' + (meta.resolved ? '⚡ 重新激活' : '💤 沉底') + '</button>' +
         '<button style="padding:8px 16px;font-size:12px;background:none;border:1px solid var(--border);border-radius:20px;cursor:pointer;color:var(--negative);" onclick="if(confirm(\'确定删除该记忆桶？此操作不可撤销。\'))deleteBucket(\'' + id + '\')">✕ 删除</button>' +
       '</div>' +
+      '<div style="margin-bottom:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">' +
+        '<label style="font-size:12px;color:var(--text-dim);">记忆呈现格式（脱水后注入给小予的样子）</label>' +
+        '<select id="dehydration-mode-select" style="padding:6px 10px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:12px;" onchange="setDehydrationMode(\'' + id + '\', this.value)">' +
+          '<option value="auto"' + ((meta.dehydration_mode || 'auto') === 'auto' ? ' selected' : '') + '>自动（按事实条数决定）</option>' +
+          '<option value="facts"' + (meta.dehydration_mode === 'facts' ? ' selected' : '') + '>仅事实清单</option>' +
+          '<option value="summary"' + (meta.dehydration_mode === 'summary' ? ' selected' : '') + '>仅摘要</option>' +
+        '</select>' +
+        '<button type="button" style="padding:6px 14px;font-size:12px;background:none;border:1px solid var(--border);border-radius:20px;cursor:pointer;color:var(--accent);" onclick="previewDehydrateCompare(\'' + id + '\')">👁 预览对比</button>' +
+      '</div>' +
+      '<div id="dehydrate-compare-' + id + '"></div>' +
       '<div id="detail-status" style="font-size:12px;margin-bottom:10px;"></div>' +
       '<div class="detail-meta">' +
         '<div class="field"><label>ID</label>' + id + '</div>' +
@@ -1322,17 +1332,6 @@ async function showDetail(id) {
           '<div style="flex:1;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">效价(0-1)</label><input type="number" id="edit-valence" value="' + (meta.valence ?? 0.5) + '" min="0" max="1" step="0.05" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
           '<div style="flex:1;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">唤醒(0-1)</label><input type="number" id="edit-arousal" value="' + (meta.arousal ?? 0.3) + '" min="0" max="1" step="0.05" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
         '</div>' +
-        '<div style="margin-bottom:10px;display:flex;gap:10px;align-items:flex-end;">' +
-          '<div style="flex:1;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">记忆呈现格式（脱水后注入给小予的样子）</label>' +
-            '<select id="edit-dehydration-mode" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;">' +
-              '<option value="auto"' + (( meta.dehydration_mode || 'auto') === 'auto' ? ' selected' : '') + '>自动（按事实条数决定）</option>' +
-              '<option value="facts"' + (meta.dehydration_mode === 'facts' ? ' selected' : '') + '>仅事实清单</option>' +
-              '<option value="summary"' + (meta.dehydration_mode === 'summary' ? ' selected' : '') + '>仅摘要</option>' +
-            '</select>' +
-          '</div>' +
-          '<button type="button" style="padding:8px 16px;font-size:12px;background:none;border:1px solid var(--border);border-radius:20px;cursor:pointer;color:var(--accent);white-space:nowrap;" onclick="previewDehydrateCompare(\'' + id + '\')">👁 预览对比</button>' +
-        '</div>' +
-        '<div id="dehydrate-compare-' + id + '"></div>' +
         '<div style="margin-bottom:10px;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">内容</label><textarea id="edit-content" style="width:100%;min-height:200px;padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;line-height:1.7;resize:vertical;font-family:inherit;">' + esc(b.content) + '</textarea></div>' +
         '<div style="display:flex;gap:8px;">' +
           '<button class="btn-primary" style="padding:10px 24px;font-size:13px;" onclick="saveBucket(\'' + id + '\')">保存修改</button>' +
@@ -1366,7 +1365,6 @@ async function saveBucket(id) {
     importance: parseInt(document.getElementById('edit-importance').value) || 5,
     valence: parseFloat(document.getElementById('edit-valence').value),
     arousal: parseFloat(document.getElementById('edit-arousal').value),
-    dehydration_mode: document.getElementById('edit-dehydration-mode').value,
     content: document.getElementById('edit-content').value,
   };
   try {
@@ -1409,6 +1407,24 @@ async function previewDehydrateCompare(id) {
       block('仅事实清单', data.variants.facts, data.auto_picks === 'facts');
   } catch (e) {
     box.innerHTML = '<div class="wake-preview-box">预览失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function setDehydrationMode(id, mode) {
+  var statusEl = document.getElementById('detail-status');
+  statusEl.innerHTML = '<span style="color:var(--text-dim);">保存格式设置中…</span>';
+  try {
+    var res = await fetch(BASE + '/api/bucket/' + id, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ dehydration_mode: mode }),
+    });
+    var data = await res.json();
+    statusEl.innerHTML = data.ok
+      ? '<span style="color:var(--positive);">✓ 呈现格式已保存（未激活记忆）</span>'
+      : '<span style="color:var(--negative);">✗ ' + (data.error || '保存失败') + '</span>';
+  } catch (e) {
+    statusEl.innerHTML = '<span style="color:var(--negative);">✗ 请求失败: ' + e.message + '</span>';
   }
 }
 
