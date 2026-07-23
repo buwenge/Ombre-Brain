@@ -802,7 +802,9 @@ async def breath(
             audit_entries = []
             for newest_position, c in enumerate(craves, start=1):
                 created = c["metadata"].get("created", "")
-                entry = f"[{created}] [bucket_id:{c['id']}]\n{strip_wikilinks(c['content'])}"
+                title = c["metadata"].get("name", "")
+                title = title if title and title != c["id"] else ""
+                entry = f"[{created}] [bucket_id:{c['id']}]{(' · ' + title) if title else ''}\n{strip_wikilinks(c['content'])}"
                 results.append(entry)
                 audit_entries.append(_audit_bucket_entry(
                     c,
@@ -1150,11 +1152,12 @@ async def hold(
     pinned: bool = False,
     feel: bool = False,
     crave: bool = False,
+    title: str = "",
     source_bucket: str = "",    valence: float = -1,
     arousal: float = -1,
     verbatim: bool = False,
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。crave=True存储色色内容,独立池子不参与普通浮现/打标/脱水,只能通过breath(domain="crave")读取,不占用其他记忆的名额。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。verbatim=True原样保留内容不脱水(适用于操作手册、代码等需要精确保留的内容)。"""
+    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。crave=True存储色色内容,独立池子不参与普通浮现/打标/脱水,只能通过breath(domain="crave")读取,不占用其他记忆的名额。title=可选标题(仅crave模式使用,类似letter_write的title)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。verbatim=True原样保留内容不脱水(适用于操作手册、代码等需要精确保留的内容)。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -1176,7 +1179,7 @@ async def hold(
             domain=["crave"],
             valence=crave_valence,
             arousal=crave_arousal,
-            name=None,
+            name=(title.strip()[:60] or None) if title else None,
             bucket_type="crave",
             verbatim=True,
         )
