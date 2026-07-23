@@ -377,10 +377,44 @@ class Dehydrator:
 
 
     # ---------------------------------------------------------
+    # Dehydration mode selection + rendering
+    # 脱水呈现模式：挑选 + 渲染
+    #
+    # emotion_state/keywords are dropped entirely — emotion_state is
+    # redundant once core_facts carries the actual narrative (a competent
+    # reader infers tone from facts), and keywords duplicate domain/tags
+    # metadata that already exists elsewhere. Only core_facts/todos/summary
+    # make it into the injected text; which of core_facts vs summary is used
+    # depends on signal density (a short, low-density memory compressed into
+    # a facts list is ~80% redundant with its own summary — verified by hand
+    # against real buckets — while a dense one loses real information if
+    # flattened into one summary sentence).
+    # ---------------------------------------------------------
+    FACTS_THRESHOLD = 4
+
+    def _pick_dehydration_mode(self, parsed: dict, override: str = "auto") -> str:
+        if override in ("facts", "summary"):
+            return override
+        core_facts = parsed.get("core_facts") or []
+        return "facts" if len(core_facts) >= self.FACTS_THRESHOLD else "summary"
+
+    def _render_dehydrated(self, parsed: dict, mode: str) -> str:
+        """Render a parsed dehydration JSON into injectable text for a given mode."""
+        if mode == "facts":
+            core_facts = parsed.get("core_facts") or []
+            body = "；".join(core_facts) if core_facts else parsed.get("summary", "")
+        else:
+            body = parsed.get("summary", "")
+        todos = parsed.get("todos") or []
+        if todos:
+            body += "\n待办：" + "；".join(todos)
+        return body
+
+    # ---------------------------------------------------------
     # Output formatting
     # 输出格式化
-    # Wraps dehydrated result with bucket name, tags, emotion coords
-    # 把脱水结果包装成带桶名、标签、情感坐标的可读文本
+    # Wraps dehydrated result with bucket name/domain header
+    # 把脱水结果包装成带桶名、主题域的可读文本
     # ---------------------------------------------------------
     def _format_output(self, content: str, metadata: dict = None) -> str:
         """
@@ -391,39 +425,23 @@ class Dehydrator:
         if metadata and isinstance(metadata, dict):
             name = metadata.get("name", "未命名")
             domains = ", ".join(metadata.get("domain", []))
-            try:
-                valence = float(metadata.get("valence", 0.5))
-                arousal = float(metadata.get("arousal", 0.3))
-            except (ValueError, TypeError):
-                valence, arousal = 0.5, 0.3
             header = f"📌 记忆桶: {name}"
             if domains:
                 header += f" [主题:{domains}]"
-            header += f" [情感:V{valence:.1f}/A{arousal:.1f}]"
-            # Show model's perspective if available (valence drift)
-            model_v = metadata.get("model_valence")
-            if model_v is not None:
-                try:
-                    header += f" [我的视角:V{float(model_v):.1f}]"
-                except (ValueError, TypeError):
-                    pass
             if metadata.get("digested"):
                 header += " [已消化]"
             header += "\n"
-        
+
         content = re.sub(r'\[\[([^\]]+)\]\]', r'\1', content)
 
-        # --- If content is dehydrated JSON, extract only summary + emotion_state ---
-        # --- 如果内容是脱水后的 JSON，只提取 summary 和 emotion_state 返回 ---
+        # --- If content is dehydrated JSON, render per the bucket's mode ---
+        # --- 如果内容是脱水后的 JSON，按桶的呈现模式渲染 ---
         try:
             parsed = json.loads(content)
             if isinstance(parsed, dict) and "summary" in parsed:
-                parts = []
-                emotion = parsed.get("emotion_state", "")
-                if emotion:
-                    parts.append(f"【情绪：{emotion}】")
-                parts.append(parsed["summary"])
-                content = "".join(parts)
+                override = (metadata or {}).get("dehydration_mode", "auto")
+                mode = self._pick_dehydration_mode(parsed, override)
+                content = self._render_dehydrated(parsed, mode)
         except (json.JSONDecodeError, TypeError):
             pass
 

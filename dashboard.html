@@ -1322,6 +1322,17 @@ async function showDetail(id) {
           '<div style="flex:1;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">效价(0-1)</label><input type="number" id="edit-valence" value="' + (meta.valence ?? 0.5) + '" min="0" max="1" step="0.05" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
           '<div style="flex:1;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">唤醒(0-1)</label><input type="number" id="edit-arousal" value="' + (meta.arousal ?? 0.3) + '" min="0" max="1" step="0.05" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;" /></div>' +
         '</div>' +
+        '<div style="margin-bottom:10px;display:flex;gap:10px;align-items:flex-end;">' +
+          '<div style="flex:1;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">记忆呈现格式（脱水后注入给小予的样子）</label>' +
+            '<select id="edit-dehydration-mode" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;">' +
+              '<option value="auto"' + (( meta.dehydration_mode || 'auto') === 'auto' ? ' selected' : '') + '>自动（按事实条数决定）</option>' +
+              '<option value="facts"' + (meta.dehydration_mode === 'facts' ? ' selected' : '') + '>仅事实清单</option>' +
+              '<option value="summary"' + (meta.dehydration_mode === 'summary' ? ' selected' : '') + '>仅摘要</option>' +
+            '</select>' +
+          '</div>' +
+          '<button type="button" style="padding:8px 16px;font-size:12px;background:none;border:1px solid var(--border);border-radius:20px;cursor:pointer;color:var(--accent);white-space:nowrap;" onclick="previewDehydrateCompare(\'' + id + '\')">👁 预览对比</button>' +
+        '</div>' +
+        '<div id="dehydrate-compare-' + id + '"></div>' +
         '<div style="margin-bottom:10px;"><label style="font-size:11px;color:var(--text-light);display:block;margin-bottom:3px;">内容</label><textarea id="edit-content" style="width:100%;min-height:200px;padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font-size:13px;line-height:1.7;resize:vertical;font-family:inherit;">' + esc(b.content) + '</textarea></div>' +
         '<div style="display:flex;gap:8px;">' +
           '<button class="btn-primary" style="padding:10px 24px;font-size:13px;" onclick="saveBucket(\'' + id + '\')">保存修改</button>' +
@@ -1355,6 +1366,7 @@ async function saveBucket(id) {
     importance: parseInt(document.getElementById('edit-importance').value) || 5,
     valence: parseFloat(document.getElementById('edit-valence').value),
     arousal: parseFloat(document.getElementById('edit-arousal').value),
+    dehydration_mode: document.getElementById('edit-dehydration-mode').value,
     content: document.getElementById('edit-content').value,
   };
   try {
@@ -1373,6 +1385,30 @@ async function saveBucket(id) {
     }
   } catch (e) {
     statusEl.innerHTML = '<span style="color:var(--negative);">✗ 请求失败: ' + e.message + '</span>';
+  }
+}
+
+async function previewDehydrateCompare(id) {
+  var box = document.getElementById('dehydrate-compare-' + id);
+  box.innerHTML = '<div class="loading">脱水中…（首次预览会真实调用一次 API，之后命中缓存不再重复计费）</div>';
+  try {
+    var res = await fetch(BASE + '/api/dehydrate-preview/' + id + '?raw=1');
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    if (!data.variants) {
+      box.innerHTML = '<div class="wake-preview-box">' + esc(data.note || '这条内容太短或是原样存储，没有走 JSON 脱水，没有可对比的版本。') + '</div>';
+      return;
+    }
+    function block(label, text, isAuto) {
+      return '<div style="margin-top:8px;"><b style="font-size:12px;">' + label + (isAuto ? ' · 自动模式会选这个' : '') + '</b>' +
+        '<div class="wake-preview-box" style="margin-left:0;">' + esc(text) + '</div></div>';
+    }
+    box.innerHTML =
+      '<div style="font-size:11px;color:var(--text-dim);margin-top:4px;">' + (data.from_cache ? '（命中缓存，未产生新的 API 调用）' : '（刚发生一次真实脱水 API 调用）') + '</div>' +
+      block('仅摘要', data.variants.summary, data.auto_picks === 'summary') +
+      block('仅事实清单', data.variants.facts, data.auto_picks === 'facts');
+  } catch (e) {
+    box.innerHTML = '<div class="wake-preview-box">预览失败: ' + esc(e.message) + '</div>';
   }
 }
 

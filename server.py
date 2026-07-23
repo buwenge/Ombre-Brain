@@ -2090,6 +2090,8 @@ async def api_bucket_update(request):
             updates["importance"] = 10
     if "digested" in body:
         updates["digested"] = bool(body["digested"])
+    if "dehydration_mode" in body and body["dehydration_mode"] in ("auto", "facts", "summary"):
+        updates["dehydration_mode"] = body["dehydration_mode"]
     if "content" in body and body["content"]:
         updates["content"] = body["content"]
 
@@ -2805,10 +2807,11 @@ async def api_dehydrate_preview(request):
     """On-demand dehydration preview for a single bucket. Read-only: dehydrate()
     only touches its own SQLite cache, never bucket metadata / activation state.
 
-    ?raw=1 bypasses _format_output()'s field-stripping (it only keeps
-    emotion_state + summary) and returns the LLM's full structured JSON
-    (core_facts/todos/keywords included) — for comparing what actually gets
-    injected today against what the fuller extraction would have looked like.
+    ?raw=1 returns the LLM's full structured JSON (core_facts/todos/keywords/
+    emotion_state/summary) plus both renderable variants ("summary" and
+    "facts", see dehydrator._render_dehydrated) and which one auto mode would
+    currently pick — so the dashboard can show a side-by-side comparison
+    before the user decides whether to override dehydration_mode.
     """
     from starlette.responses import JSONResponse
     err = _require_auth(request)
@@ -2831,7 +2834,23 @@ async def api_dehydrate_preview(request):
                 parsed = _json_lib.loads(raw_text)
             except (ValueError, TypeError):
                 parsed = None
-            return JSONResponse({"id": bucket_id, "raw": parsed, "raw_text": raw_text, "from_cache": bool(cached)})
+            variants = None
+            auto_picks = None
+            if isinstance(parsed, dict) and "summary" in parsed:
+                variants = {
+                    "summary": dehydrator._render_dehydrated(parsed, "summary"),
+                    "facts": dehydrator._render_dehydrated(parsed, "facts"),
+                }
+                auto_picks = dehydrator._pick_dehydration_mode(parsed, "auto")
+            return JSONResponse({
+                "id": bucket_id,
+                "raw": parsed,
+                "raw_text": raw_text,
+                "from_cache": bool(cached),
+                "variants": variants,
+                "auto_picks": auto_picks,
+                "current_override": clean_meta.get("dehydration_mode", "auto"),
+            })
         summary = await dehydrator.dehydrate(content, clean_meta)
         return JSONResponse({"id": bucket_id, "summary": summary})
     except Exception as e:

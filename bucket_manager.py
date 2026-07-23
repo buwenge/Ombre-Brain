@@ -321,6 +321,8 @@ class BucketManager:
                 post["importance"] = 10  # pinned → lock importance to 10
         if "digested" in kwargs:
             post["digested"] = bool(kwargs["digested"])
+        if "dehydration_mode" in kwargs:
+            post["dehydration_mode"] = kwargs["dehydration_mode"]
         if "model_valence" in kwargs:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
         # --- letter 元数据字段（署名/称呼/标题/信件日期），原样透传 ---
