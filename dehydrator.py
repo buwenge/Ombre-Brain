@@ -45,17 +45,13 @@ DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水�
 
 压缩规则：
 1. 提取所有核心事实，去除冗余修饰和重复
-2. 保留最新的情绪状态和态度
-3. 保留所有待办/未完成事项
-4. 关键数字、日期、名称必须保留
-5. 目标压缩率 > 70%
+2. 待办/未完成事项如果是原文里明确提到的具体行动项，就写进 core_facts 里（不要单独改写成命令句/祈使句，事实该怎么表述就怎么表述）
+3. 关键数字、日期、名称必须保留
+4. 目标压缩率 > 70%
 
 输出格式（纯 JSON，无其他内容）：
 {
   "core_facts": ["事实1", "事实2"],
-  "emotion_state": "当前情绪关键词",
-  "todos": ["待办1", "待办2"],
-  "keywords": ["关键词1", "关键词2"],
   "summary": "50字以内的核心总结"
 }"""
 
@@ -380,15 +376,20 @@ class Dehydrator:
     # Dehydration mode selection + rendering
     # 脱水呈现模式：挑选 + 渲染
     #
-    # emotion_state/keywords are dropped entirely — emotion_state is
+    # emotion_state/keywords/todos are dropped entirely. emotion_state is
     # redundant once core_facts carries the actual narrative (a competent
-    # reader infers tone from facts), and keywords duplicate domain/tags
-    # metadata that already exists elsewhere. Only core_facts/todos/summary
-    # make it into the injected text; which of core_facts vs summary is used
-    # depends on signal density (a short, low-density memory compressed into
-    # a facts list is ~80% redundant with its own summary — verified by hand
-    # against real buckets — while a dense one loses real information if
-    # flattened into one summary sentence).
+    # reader infers tone from facts); keywords duplicate domain/tags metadata
+    # that already exists elsewhere; todos turned out to just be core_facts
+    # re-written as imperative sentences for "teaching"-style content with no
+    # real separate action item (verified against a real bucket — every
+    # "todo" was a word-for-word restatement of a fact already listed), so it
+    # added pure duplication with zero information gain. Genuine action items
+    # belong in core_facts like any other fact from the source text (see
+    # DEHYDRATE_PROMPT). Only core_facts/summary make it into the injected
+    # text; which one is used depends on signal density (a short, low-density
+    # memory compressed into a facts list is ~80% redundant with its own
+    # summary — verified by hand against real buckets — while a dense one
+    # loses real information if flattened into one summary sentence).
     # ---------------------------------------------------------
     FACTS_THRESHOLD = 4
 
@@ -402,13 +403,8 @@ class Dehydrator:
         """Render a parsed dehydration JSON into injectable text for a given mode."""
         if mode == "facts":
             core_facts = parsed.get("core_facts") or []
-            body = "；".join(core_facts) if core_facts else parsed.get("summary", "")
-        else:
-            body = parsed.get("summary", "")
-        todos = parsed.get("todos") or []
-        if todos:
-            body += "\n待办：" + "；".join(todos)
-        return body
+            return "；".join(core_facts) if core_facts else parsed.get("summary", "")
+        return parsed.get("summary", "")
 
     # ---------------------------------------------------------
     # Output formatting

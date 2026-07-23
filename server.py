@@ -2807,11 +2807,13 @@ async def api_dehydrate_preview(request):
     """On-demand dehydration preview for a single bucket. Read-only: dehydrate()
     only touches its own SQLite cache, never bucket metadata / activation state.
 
-    ?raw=1 returns the LLM's full structured JSON (core_facts/todos/keywords/
-    emotion_state/summary) plus both renderable variants ("summary" and
-    "facts", see dehydrator._render_dehydrated) and which one auto mode would
-    currently pick — so the dashboard can show a side-by-side comparison
-    before the user decides whether to override dehydration_mode.
+    ?raw=1 returns the LLM's structured JSON (core_facts/summary — older
+    cache entries from before todos/keywords/emotion_state were dropped may
+    still carry those extra fields, harmlessly ignored) plus both renderable
+    variants ("summary" and "facts", see dehydrator._render_dehydrated) and
+    which one auto mode would currently pick — so the dashboard can show a
+    side-by-side comparison before the user decides whether to override
+    dehydration_mode.
     """
     from starlette.responses import JSONResponse
     err = _require_auth(request)
