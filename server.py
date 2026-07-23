@@ -345,7 +345,7 @@ def _select_dream_recent(all_buckets: list[dict], limit: int = DREAM_RECENT_LIMI
     """
     candidates = [
         b for b in all_buckets
-        if b["metadata"].get("type") not in ("permanent", "feel", "letter")
+        if b["metadata"].get("type") not in ("permanent", "feel", "letter", "crave")
         and not b["metadata"].get("pinned", False)
         and not b["metadata"].get("protected", False)
     ]
@@ -358,7 +358,7 @@ def _weight_rank_snapshot(all_buckets: list[dict]) -> tuple[list[dict], dict[str
     eligible = [
         b for b in all_buckets
         if not b["metadata"].get("resolved", False)
-        and b["metadata"].get("type") not in ("permanent", "feel", "letter")
+        and b["metadata"].get("type") not in ("permanent", "feel", "letter", "crave")
         and not b["metadata"].get("pinned", False)
         and not b["metadata"].get("protected", False)
     ]
@@ -415,7 +415,7 @@ async def breath_hook(request):
         # unresolved by score, excluding the newest memories reserved for dream
         unresolved = [b for b in all_buckets
                       if not b["metadata"].get("resolved", False)
-                      and b["metadata"].get("type") not in ("permanent", "feel", "letter")
+                      and b["metadata"].get("type") not in ("permanent", "feel", "letter", "crave")
                       and not b["metadata"].get("pinned")
                       and not b["metadata"].get("protected")
                       and b["id"] not in dream_ids]
@@ -712,7 +712,7 @@ async def breath(
         filtered = [
             b for b in all_buckets
             if int(b["metadata"].get("importance", 0)) >= importance_min
-            and b["metadata"].get("type") not in ("feel", "letter")
+            and b["metadata"].get("type") not in ("feel", "letter", "crave")
         ]
         filtered.sort(key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True)
         filtered = filtered[:20]
@@ -782,6 +782,55 @@ async def breath(
             )
             return "读取 feel 失败。"
 
+    # --- Crave retrieval: domain="crave" is a special channel ---
+    # --- Crave 检索：domain="crave" 是独立入口，不参与普通浮现/搜索 ---
+    if domain.strip().lower() == "crave":
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+            craves = [
+                b for b in all_buckets
+                if b["metadata"].get("type") == "crave" and not b["metadata"].get("digested", False)
+            ]
+            craves.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+            if not craves:
+                _record_surface_audit(
+                    "crave", [], total_buckets=len(all_buckets), returned_count=0, status="complete"
+                )
+                return "没有存过 crave。"
+            craves = craves[:10]
+            results = []
+            audit_entries = []
+            for newest_position, c in enumerate(craves, start=1):
+                created = c["metadata"].get("created", "")
+                entry = f"[{created}] [bucket_id:{c['id']}]\n{strip_wikilinks(c['content'])}"
+                results.append(entry)
+                audit_entries.append(_audit_bucket_entry(
+                    c,
+                    channel="crave",
+                    newest_position=newest_position,
+                    output_position=len(results),
+                    outcome="surfaced",
+                ))
+                if count_tokens_approx("\n---\n".join(results)) > max_tokens:
+                    break
+            _record_surface_audit(
+                "crave",
+                audit_entries,
+                total_buckets=len(all_buckets),
+                candidate_count=len(craves),
+                returned_count=len(results),
+                max_results=10,
+                max_tokens=max_tokens,
+                status="complete",
+            )
+            return "=== crave ===\n" + "\n---\n".join(results)
+        except Exception as e:
+            logger.error(f"Crave retrieval failed: {e}")
+            _record_surface_audit(
+                "crave", [], returned_count=0, status="error", error=type(e).__name__
+            )
+            return "读取 crave 失败。"
+
     # --- No args or empty query: surfacing mode (weight pool active push) ---
     # --- 无参数或空query：浮现模式（权重池主动推送）---
     if not query or not query.strip():
@@ -836,7 +885,7 @@ async def breath(
         unresolved = [
             b for b in all_buckets
             if not b["metadata"].get("resolved", False)
-            and b["metadata"].get("type") not in ("permanent", "feel", "letter")
+            and b["metadata"].get("type") not in ("permanent", "feel", "letter", "crave")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
             and b["id"] not in dream_ids
@@ -1000,7 +1049,7 @@ async def breath(
         for vid, sim_score in vector_results:
             if vid not in matched_ids and sim_score > 0.5:
                 bucket = await bucket_mgr.get(vid)
-                if bucket and bucket["metadata"].get("type") not in ("feel", "letter"):
+                if bucket and bucket["metadata"].get("type") not in ("feel", "letter", "crave"):
                     bucket["score"] = round(sim_score * 100, 2)
                     bucket["vector_match"] = True
                     matches.append(bucket)
@@ -1100,11 +1149,12 @@ async def hold(
     importance: int = 5,
     pinned: bool = False,
     feel: bool = False,
+    crave: bool = False,
     source_bucket: str = "",    valence: float = -1,
     arousal: float = -1,
     verbatim: bool = False,
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。verbatim=True原样保留内容不脱水(适用于操作手册、代码等需要精确保留的内容)。"""
+    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。crave=True存储色色内容,独立池子不参与普通浮现/打标/脱水,只能通过breath(domain="crave")读取,不占用其他记忆的名额。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。verbatim=True原样保留内容不脱水(适用于操作手册、代码等需要精确保留的内容)。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -1113,6 +1163,24 @@ async def hold(
 
     importance = max(1, min(10, importance))
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+    # --- Crave mode: store as crave type, isolated pool, no tagging/dehydration ---
+    # --- Crave 模式：存为 crave 类型，独立池子，不打标不脱水 ---
+    if crave:
+        crave_valence = valence if 0 <= valence <= 1 else 0.5
+        crave_arousal = arousal if 0 <= arousal <= 1 else 0.5
+        bucket_id = await bucket_mgr.create(
+            content=content,
+            tags=["__crave__"] + extra_tags,
+            importance=importance,
+            domain=["crave"],
+            valence=crave_valence,
+            arousal=crave_arousal,
+            name=None,
+            bucket_type="crave",
+            verbatim=True,
+        )
+        return f"🔥crave→{bucket_id}"
 
     # --- Feel mode: store as feel type, minimal metadata ---
     # --- Feel 模式：存为 feel 类型，最少元数据 ---
@@ -1451,7 +1519,7 @@ async def _collect_diagnostics(include_archive: bool = True) -> dict:
         ):
             undigested += 1
         if (
-            btype not in ("feel", "letter", "archived")
+            btype not in ("feel", "letter", "crave", "archived")
             and (not meta.get("domain") or meta.get("domain") == ["未分类"])
         ):
             unclassified_ids.append(bucket["id"])
@@ -2230,7 +2298,7 @@ async def _run_tag_backfill():
         targets = [
             b for b in all_buckets
             if b.get("metadata", {}).get("domain") == ["未分类"]
-            and b.get("metadata", {}).get("type") not in ("feel", "letter")
+            and b.get("metadata", {}).get("type") not in ("feel", "letter", "crave")
         ]
 
         _tag_backfill_state.update({

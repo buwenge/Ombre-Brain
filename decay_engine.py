@@ -113,6 +113,10 @@ class DecayEngine:
         if metadata.get("type") == "letter":
             return 999.0
 
+        # --- Crave buckets: never decay, isolated from the shared surfacing pool ---
+        if metadata.get("type") == "crave":
+            return 999.0
+
         importance = max(1, min(10, int(metadata.get("importance", 5))))
         activation_count = max(1.0, float(metadata.get("activation_count", 1)))
 
@@ -220,9 +224,9 @@ class DecayEngine:
         for bucket in buckets:
             meta = bucket.get("metadata", {})
 
-            # Skip permanent / pinned / protected / feel / letter buckets
-            # 跳过固化桶、钉选/保护桶、feel 桶和 letter 桶
-            if meta.get("type") in ("permanent", "feel", "letter") or meta.get("pinned") or meta.get("protected"):
+            # Skip permanent / pinned / protected / feel / letter / crave buckets
+            # 跳过固化桶、钉选/保护桶、feel 桶、letter 桶和 crave 桶
+            if meta.get("type") in ("permanent", "feel", "letter", "crave") or meta.get("pinned") or meta.get("protected"):
                 continue
 
             checked += 1

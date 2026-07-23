@@ -59,6 +59,7 @@ class BucketManager:
         self.archive_dir = os.path.join(self.base_dir, "archive")
         self.feel_dir = os.path.join(self.base_dir, "feel")
         self.letter_dir = os.path.join(self.base_dir, "letters")
+        self.crave_dir = os.path.join(self.base_dir, "crave")
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
         self._activation_callback = None
@@ -193,12 +194,16 @@ class BucketManager:
             type_dir = self.feel_dir
         elif bucket_type == "letter":
             type_dir = self.letter_dir
+        elif bucket_type == "crave":
+            type_dir = self.crave_dir
         else:
             type_dir = self.dynamic_dir
         if bucket_type == "feel":
             primary_domain = "沉淀物"  # feel subfolder name
         elif bucket_type == "letter":
             primary_domain = "history"  # letters/history/ subfolder
+        elif bucket_type == "crave":
+            primary_domain = "记录"  # crave subfolder name
         else:
             primary_domain = sanitize_name(domain[0]) if domain else "未分类"
         target_dir = os.path.join(type_dir, primary_domain)
@@ -526,10 +531,10 @@ class BucketManager:
 
         limit = limit or self.max_results
         all_buckets = await self.list_all(include_archive=False)
-        # feel/letter are dedicated channels (breath(domain="feel") / letter_read),
-        # not reachable via keyword or vector search — same isolation as elsewhere
-        # in server.py (breath surfacing, importance_min pull).
-        all_buckets = [b for b in all_buckets if b["metadata"].get("type") not in ("feel", "letter")]
+        # feel/letter/crave are dedicated channels (breath(domain="feel"/"crave") /
+        # letter_read), not reachable via keyword or vector search — same isolation
+        # as elsewhere in server.py (breath surfacing, importance_min pull).
+        all_buckets = [b for b in all_buckets if b["metadata"].get("type") not in ("feel", "letter", "crave")]
 
         if not all_buckets:
             return []
@@ -701,7 +706,7 @@ class BucketManager:
         """
         buckets = []
 
-        dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir, self.letter_dir]
+        dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir, self.letter_dir, self.crave_dir]
         if include_archive:
             dirs.append(self.archive_dir)
 
@@ -734,6 +739,7 @@ class BucketManager:
             "archive_count": 0,
             "feel_count": 0,
             "letter_count": 0,
+            "crave_count": 0,
             "total_size_kb": 0.0,
             "domains": {},
         }
@@ -744,6 +750,7 @@ class BucketManager:
             (self.archive_dir, "archive_count"),
             (self.feel_dir, "feel_count"),
             (self.letter_dir, "letter_count"),
+            (self.crave_dir, "crave_count"),
         ]:
             if not os.path.exists(subdir):
                 continue
@@ -817,7 +824,7 @@ class BucketManager:
         """
         if not bucket_id:
             return None
-        for dir_path in [self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir, self.letter_dir]:
+        for dir_path in [self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir, self.letter_dir, self.crave_dir]:
             if not os.path.exists(dir_path):
                 continue
             for root, _, files in os.walk(dir_path):
