@@ -2092,6 +2092,8 @@ async def api_bucket_update(request):
         updates["digested"] = bool(body["digested"])
     if "dehydration_mode" in body and body["dehydration_mode"] in ("auto", "facts", "summary"):
         updates["dehydration_mode"] = body["dehydration_mode"]
+    if "verbatim" in body:
+        updates["verbatim"] = bool(body["verbatim"])
     if "content" in body and body["content"]:
         updates["content"] = body["content"]
 
