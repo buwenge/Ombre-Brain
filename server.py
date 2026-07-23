@@ -2803,7 +2803,13 @@ async def api_simulate_crave(request):
 @mcp.custom_route("/api/dehydrate-preview/{bucket_id}", methods=["GET"])
 async def api_dehydrate_preview(request):
     """On-demand dehydration preview for a single bucket. Read-only: dehydrate()
-    only touches its own SQLite cache, never bucket metadata / activation state."""
+    only touches its own SQLite cache, never bucket metadata / activation state.
+
+    ?raw=1 bypasses _format_output()'s field-stripping (it only keeps
+    emotion_state + summary) and returns the LLM's full structured JSON
+    (core_facts/todos/keywords included) — for comparing what actually gets
+    injected today against what the fuller extraction would have looked like.
+    """
     from starlette.responses import JSONResponse
     err = _require_auth(request)
     if err: return err
@@ -2811,9 +2817,22 @@ async def api_dehydrate_preview(request):
     bucket = await bucket_mgr.get(bucket_id)
     if not bucket:
         return JSONResponse({"error": "not found"}, status_code=404)
+    content = strip_wikilinks(bucket["content"])
+    clean_meta = {k: v for k, v in bucket["metadata"].items() if k != "tags"}
     try:
-        clean_meta = {k: v for k, v in bucket["metadata"].items() if k != "tags"}
-        summary = await dehydrator.dehydrate(strip_wikilinks(bucket["content"]), clean_meta)
+        if request.query_params.get("raw") == "1":
+            if clean_meta.get("verbatim") or count_tokens_approx(content) < 100:
+                return JSONResponse({"id": bucket_id, "raw": None, "note": "verbatim 或内容过短，未经过 JSON 脱水"})
+            cached = dehydrator._get_cached_summary(content)
+            raw_text = cached if cached else await dehydrator._api_dehydrate(content)
+            if not cached:
+                dehydrator._set_cached_summary(content, raw_text)
+            try:
+                parsed = _json_lib.loads(raw_text)
+            except (ValueError, TypeError):
+                parsed = None
+            return JSONResponse({"id": bucket_id, "raw": parsed, "raw_text": raw_text, "from_cache": bool(cached)})
+        summary = await dehydrator.dehydrate(content, clean_meta)
         return JSONResponse({"id": bucket_id, "summary": summary})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
