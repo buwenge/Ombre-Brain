@@ -234,15 +234,20 @@ class Dehydrator:
         return row[0] if row else None
 
     def _set_cached_summary(self, content: str, summary: str):
-        """Store dehydration result in cache."""
+        """Store dehydration result in cache.
+        并发脱水时多个桶可能同时想写缓存；写失败不该连累已经拿到手的摘要结果，
+        只记一条 warning，这条内容下次没命中缓存时会重新算一次，无损。"""
         content_hash = hashlib.sha256(content.encode()).hexdigest()
-        conn = sqlite3.connect(self.cache_db_path)
-        conn.execute(
-            "INSERT OR REPLACE INTO dehydration_cache (content_hash, summary, model) VALUES (?, ?, ?)",
-            (content_hash, summary, self.model)
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn = sqlite3.connect(self.cache_db_path)
+            conn.execute(
+                "INSERT OR REPLACE INTO dehydration_cache (content_hash, summary, model) VALUES (?, ?, ?)",
+                (content_hash, summary, self.model)
+            )
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.warning(f"Dehydration cache write failed / 脱水缓存写入失败（不影响本次结果）: {e}")
 
     def set_manual_summary(self, content: str, parsed: dict) -> str:
         """Overwrite the cached dehydration for this content with a manually

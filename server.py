@@ -2577,6 +2577,30 @@ def _sim_row(bucket: dict, score: float, **extra) -> dict:
     }
 
 
+async def _dehydrate_concurrent(buckets: list[dict], concurrency: int = 5) -> dict:
+    """Dehydrate multiple buckets in parallel (bounded), one dehydrator.dehydrate()
+    call per bucket. Cache hits return instantly; cache misses (real API calls)
+    overlap instead of queuing one after another.
+    Returns {bucket_id: (summary_or_None, error_or_None)} — never raises, so a
+    single bad bucket can't take the rest down with it.
+    并发脱水多个桶（限流），缓存命中的秒回，未命中的（真调API）互相重叠而不是排队。
+    返回 {bucket_id: (摘要或None, 异常或None)}，不抛异常，一个桶坏了不连累其他桶。
+    """
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _one(b: dict):
+        async with sem:
+            try:
+                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                return b["id"], (summary, None)
+            except Exception as e:
+                return b["id"], (None, e)
+
+    pairs = await asyncio.gather(*(_one(b) for b in buckets))
+    return dict(pairs)
+
+
 @mcp.custom_route("/api/simulate/breath", methods=["GET"])
 async def api_simulate_breath(request):
     """Dry-run of breath()'s no-query surfacing mode (line ~838 in breath())."""
@@ -2620,17 +2644,6 @@ async def api_simulate_breath(request):
     surfaced = []
     not_surfaced = []
 
-    # --- pinned/protected: always surface, real dehydrate (matches production) ---
-    token_budget = max_tokens
-    for b in pinned_buckets:
-        try:
-            clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-            summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-            token_budget -= count_tokens_approx(summary)
-            surfaced.append(_sim_row(b, score_of(b), channel="pin", summary=summary))
-        except Exception as e:
-            not_surfaced.append(_sim_row(b, score_of(b), reason="dehydrate_error", detail=str(e)))
-
     # --- everything else that isn't in `unresolved`: classify why it's excluded ---
     for b in all_buckets:
         bid = b["id"]
@@ -2670,6 +2683,22 @@ async def api_simulate_breath(request):
     for b in beyond_cap:
         not_surfaced.append(_sim_row(b, score_of(b), reason="beyond_max_results"))
 
+    # --- dehydrate pinned + chosen concurrently (bounded), THEN apply the exact
+    # same sequential token-budget bookkeeping breath() uses. Concurrency only
+    # speeds up the I/O; the selection outcome is identical to doing it one at a time. ---
+    # --- 钉选桶 + 候选桶并发脱水（限流），之后再按 breath() 原本的顺序逐条扣 token 预算。
+    # 并发只是让"等结果"这一步重叠，选桶/扣预算的结果跟排队一个个做完全一样。---
+    dehydrated = await _dehydrate_concurrent(pinned_buckets + chosen, concurrency=5)
+
+    token_budget = max_tokens
+    for b in pinned_buckets:
+        summary, err = dehydrated.get(b["id"], (None, RuntimeError("missing")))
+        if err:
+            not_surfaced.append(_sim_row(b, score_of(b), reason="dehydrate_error", detail=str(err)))
+            continue
+        token_budget -= count_tokens_approx(summary)
+        surfaced.append(_sim_row(b, score_of(b), channel="pin", summary=summary))
+
     stopped = False
     for b in chosen:
         if stopped:
@@ -2679,19 +2708,18 @@ async def api_simulate_breath(request):
             not_surfaced.append(_sim_row(b, score_of(b), reason="token_exhausted"))
             stopped = True
             continue
-        try:
-            clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-            summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-            summary_tokens = count_tokens_approx(summary)
-            if summary_tokens > token_budget:
-                not_surfaced.append(_sim_row(b, score_of(b), reason="summary_exceeds_budget"))
-                stopped = True
-                continue
-            token_budget -= summary_tokens
-            channel = "cold_start" if b["id"] in cold_start_ids else "dynamic"
-            surfaced.append(_sim_row(b, score_of(b), channel=channel, summary=summary))
-        except Exception as e:
-            not_surfaced.append(_sim_row(b, score_of(b), reason="dehydrate_error", detail=str(e)))
+        summary, err = dehydrated.get(b["id"], (None, RuntimeError("missing")))
+        if err:
+            not_surfaced.append(_sim_row(b, score_of(b), reason="dehydrate_error", detail=str(err)))
+            continue
+        summary_tokens = count_tokens_approx(summary)
+        if summary_tokens > token_budget:
+            not_surfaced.append(_sim_row(b, score_of(b), reason="summary_exceeds_budget"))
+            stopped = True
+            continue
+        token_budget -= summary_tokens
+        channel = "cold_start" if b["id"] in cold_start_ids else "dynamic"
+        surfaced.append(_sim_row(b, score_of(b), channel=channel, summary=summary))
 
     not_surfaced.sort(key=lambda r: r["score"] if r["score"] is not None else -1, reverse=True)
     return JSONResponse({
