@@ -65,7 +65,11 @@ config = load_config()
 setup_logging(config.get("log_level", "INFO"))
 logger = logging.getLogger("ombre_brain")
 
-# --- Runtime env vars (port + webhook) / 运行时环境变量 ---
+# --- Runtime env vars (bind host + port + webhook) / 运行时环境变量 ---
+# OMBRE_BIND_HOST: HTTP/SSE 监听地址，默认 0.0.0.0 以保持容器部署兼容。
+# 裸机仅经本地反代访问时建议设为 127.0.0.1。
+OMBRE_BIND_HOST = os.environ.get("OMBRE_BIND_HOST", "0.0.0.0").strip() or "0.0.0.0"
+
 # OMBRE_PORT: HTTP/SSE 监听端口，默认 8000
 try:
     OMBRE_PORT = int(os.environ.get("OMBRE_PORT", "8000") or "8000")
@@ -110,11 +114,11 @@ import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  
 surface_audit = SurfaceAuditLog(config["buckets_dir"], max_events=50)
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
-# host="0.0.0.0" so Docker container's SSE is externally reachable
+# OMBRE_BIND_HOST defaults to 0.0.0.0 so Docker SSE remains externally reachable.
 # stdio mode ignores host (no network)
 mcp = FastMCP(
     "Ombre Brain",
-    host="0.0.0.0",
+    host=OMBRE_BIND_HOST,
     port=OMBRE_PORT,
 )
 
@@ -3374,6 +3378,6 @@ if __name__ == "__main__":
             expose_headers=["*"],
         )
         logger.info("CORS middleware enabled for remote transport / 已启用 CORS 中间件")
-        uvicorn.run(_app, host="0.0.0.0", port=OMBRE_PORT)
+        uvicorn.run(_app, host=OMBRE_BIND_HOST, port=OMBRE_PORT)
     else:
         mcp.run(transport=transport)
