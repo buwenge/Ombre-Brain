@@ -43,7 +43,7 @@ import secrets
 import time
 import json as _json_lib
 import httpx
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 
 # --- Ensure same-directory modules can be imported ---
@@ -2869,13 +2869,17 @@ async def api_dehydrate_preview(request):
             if clean_meta.get("verbatim") or count_tokens_approx(content) < 100:
                 return JSONResponse({"id": bucket_id, "raw": None, "note": "verbatim 或内容过短，未经过 JSON 脱水"})
             cached = dehydrator._get_cached_summary(content)
+            parsed = None
+            if cached:
+                try:
+                    parsed = dehydrator._parse_dehydration(cached, source=content[:3000])
+                except ValueError:
+                    cached = None
             raw_text = cached if cached else await dehydrator._api_dehydrate(content)
+            if parsed is None:
+                parsed = dehydrator._parse_dehydration(raw_text, source=content[:3000])
             if not cached:
                 dehydrator._set_cached_summary(content, raw_text)
-            try:
-                parsed = _json_lib.loads(raw_text)
-            except (ValueError, TypeError):
-                parsed = None
             variants = None
             auto_picks = None
             if isinstance(parsed, dict) and "summary" in parsed:
@@ -2924,7 +2928,165 @@ async def api_dehydrate_preview_save(request):
     content = strip_wikilinks(bucket["content"])
     parsed = {"core_facts": [str(f) for f in core_facts], "summary": summary.strip()}
     content_hash = dehydrator.set_manual_summary(content, parsed)
-    await bucket_mgr.update(bucket_id, touch=False, dehydration_edited_hash=content_hash)
+    updated = await bucket_mgr.update(
+        bucket_id,
+        touch=False,
+        dehydration_edited_hash=content_hash,
+        verbatim=False,
+    )
+    if not updated:
+        return JSONResponse({"error": "update failed"}, status_code=500)
+    return JSONResponse({"ok": True})
+
+
+def _dehydration_queue_rows(
+    all_buckets: list[dict],
+    scope: str,
+    today=None,
+    timezone_offset_minutes: int = 0,
+) -> list[dict]:
+    """Build the manual-review queue without reading or changing any cache."""
+    today = today or datetime.now().date()
+    oldest = today - timedelta(days=6)
+    rows = []
+    for bucket in all_buckets:
+        meta = bucket.get("metadata", {})
+        if meta.get("type", "dynamic") not in ("dynamic", "permanent"):
+            continue
+        content = strip_wikilinks(bucket.get("content", ""))
+        if meta.get("verbatim") or count_tokens_approx(content) < 100:
+            continue
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        edited_hash = str(meta.get("dehydration_edited_hash") or "")
+        if edited_hash == content_hash:
+            continue
+        created = str(meta.get("created") or "")
+        try:
+            created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            # Browser getTimezoneOffset is UTC - local (China = -480).
+            # Bucket timestamps are currently server-local naive timestamps;
+            # production runs in UTC, so translate them to the reviewer's day.
+            if created_dt.tzinfo is not None:
+                created_dt = created_dt.astimezone(timezone.utc).replace(tzinfo=None)
+            created_date = (created_dt - timedelta(minutes=timezone_offset_minutes)).date()
+        except (ValueError, TypeError):
+            created_date = None
+        if scope == "today" and created_date != today:
+            continue
+        if scope == "week" and (created_date is None or created_date < oldest or created_date > today):
+            continue
+        rows.append({
+            "id": bucket["id"],
+            "name": meta.get("name") or bucket["id"],
+            "type": meta.get("type", "dynamic"),
+            "domain": meta.get("domain", []),
+            "created": created,
+            "content_chars": len(content),
+            "estimated_tokens": count_tokens_approx(content),
+            "content_preview": content[:160],
+            "stale_manual": bool(edited_hash),
+        })
+    rows.sort(key=lambda row: row["created"], reverse=True)
+    return rows
+
+
+@mcp.custom_route("/api/dehydration-queue", methods=["GET"])
+async def api_dehydration_queue(request):
+    """List normal buckets that still need a human-approved dehydration."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    scope = request.query_params.get("scope", "today")
+    if scope not in ("today", "week", "all"):
+        return JSONResponse({"error": "scope must be today, week or all"}, status_code=400)
+    try:
+        reviewer_today = datetime.fromisoformat(
+            request.query_params.get("today", datetime.now().date().isoformat())
+        ).date()
+        timezone_offset = int(request.query_params.get("tz_offset", "0"))
+        if not -840 <= timezone_offset <= 840:
+            raise ValueError
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "invalid reviewer date or timezone"}, status_code=400)
+    try:
+        buckets = await bucket_mgr.list_all(include_archive=False)
+        rows = _dehydration_queue_rows(
+            buckets,
+            scope,
+            today=reviewer_today,
+            timezone_offset_minutes=timezone_offset,
+        )
+        return JSONResponse({"scope": scope, "count": len(rows), "items": rows})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@mcp.custom_route("/api/dehydration-review/{bucket_id}", methods=["GET"])
+async def api_dehydration_review(request):
+    """Open a review without triggering the LLM or mutating the cache."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    meta = bucket.get("metadata", {})
+    content = strip_wikilinks(bucket.get("content", ""))
+    cached = dehydrator._get_cached_summary(content)
+    parsed = None
+    cache_issue = ""
+    if cached:
+        try:
+            parsed = dehydrator._parse_dehydration(cached, source=content[:3000])
+        except ValueError as exc:
+            cache_issue = str(exc)
+    return JSONResponse({
+        "id": bucket_id,
+        "name": meta.get("name") or bucket_id,
+        "created": meta.get("created", ""),
+        "domain": meta.get("domain", []),
+        "content": content,
+        "content_chars": len(content),
+        "estimated_tokens": count_tokens_approx(content),
+        "cached": parsed,
+        "cache_issue": cache_issue,
+        "manual_current": bool(meta.get("dehydration_edited_hash")) and (
+            meta.get("dehydration_edited_hash") == hashlib.sha256(content.encode()).hexdigest()
+        ),
+    })
+
+
+@mcp.custom_route("/api/dehydration-review/{bucket_id}/draft", methods=["POST"])
+async def api_dehydration_review_draft(request):
+    """Generate an uncached AI draft, split against the complete source."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    content = strip_wikilinks(bucket.get("content", ""))
+    try:
+        draft = await dehydrator.generate_review_draft(content)
+        return JSONResponse({"id": bucket_id, **draft})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@mcp.custom_route("/api/dehydration-review/{bucket_id}/verbatim", methods=["POST"])
+async def api_dehydration_review_verbatim(request):
+    """Approve keeping the complete original, without activating the bucket."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+    if not await bucket_mgr.get(bucket_id):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    updated = await bucket_mgr.update(bucket_id, touch=False, verbatim=True)
+    if not updated:
+        return JSONResponse({"error": "update failed"}, status_code=500)
     return JSONResponse({"ok": True})
 
 

@@ -47,13 +47,22 @@ DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水�
 1. 提取所有核心事实，去除冗余修饰和重复
 2. 待办/未完成事项如果是原文里明确提到的具体行动项，就写进 core_facts 里（不要单独改写成命令句/祈使句，事实该怎么表述就怎么表述）
 3. 关键数字、日期、名称必须保留
-4. 目标压缩率 > 70%
+4. 严格保留原文的人称、称呼和主体关系：原文的“我”“你”“小予”等不得改写成“用户”“使用者”“作者”“对方”“助手”或“AI”，不得调换谁对谁做了什么
+5. 不得补充原文没有明确说出的动机、因果、评价或关系
+6. 目标压缩率 > 70%；如果无法兼顾事实完整与压缩率，优先保证事实和人物关系正确
 
 输出格式（纯 JSON，无其他内容）：
 {
   "core_facts": ["事实1", "事实2"],
   "summary": "50字以内的核心总结"
 }"""
+
+
+# Dashboard review drafts use the same factual constraints as normal
+# dehydration, but are never cached until the user explicitly saves.
+REVIEW_DEHYDRATE_PROMPT = DEHYDRATE_PROMPT + """
+
+这是人工审核草稿。只处理本次给出的这一段，不要猜测前后文。尽量让每条事实都能在原文中直接找到依据。"""
 
 
 # --- Diary digest prompt: split daily notes into independent memory entries ---
@@ -254,9 +263,107 @@ class Dehydrator:
         edited core_facts/summary, replacing whatever the LLM produced.
         Returns the content hash the edit is pinned to — callers store this
         on the bucket to detect drift if the raw content changes later."""
-        raw_text = json.dumps(parsed, ensure_ascii=False)
+        raw_text = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
         self._set_cached_summary(content, raw_text)
         return hashlib.sha256(content.encode()).hexdigest()
+
+    def _deepseek_thinking_body(self) -> dict | None:
+        """Disable DeepSeek's default thinking mode for structured jobs."""
+        marker = f"{self.model} {self.base_url}".lower()
+        if "deepseek" in marker:
+            return {"thinking": {"type": "disabled"}}
+        return None
+
+    async def _chat_completion(self, **kwargs):
+        """Call the configured provider with provider-specific safe options."""
+        extra_body = self._deepseek_thinking_body()
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        return await self.client.chat.completions.create(**kwargs)
+
+    def _parse_dehydration(self, raw: str, source: str = "") -> dict:
+        """Parse and validate the only two fields accepted into the cache."""
+        cleaned = (raw or "").strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        try:
+            parsed = json.loads(cleaned)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ValueError("脱水返回的不是完整 JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("脱水返回必须是 JSON 对象")
+        facts = parsed.get("core_facts")
+        summary = parsed.get("summary")
+        if not isinstance(facts, list) or not all(isinstance(item, str) for item in facts):
+            raise ValueError("脱水返回缺少有效的 core_facts")
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError("脱水返回缺少有效的 summary")
+        normalized = {
+            "core_facts": [item.strip() for item in facts if item.strip()],
+            "summary": summary.strip(),
+        }
+        if source:
+            output = "\n".join(normalized["core_facts"] + [normalized["summary"]])
+            for invented_role in ("用户", "使用者", "作者", "对方", "助手", "AI"):
+                if invented_role in output and invented_role not in source:
+                    raise ValueError(f"草稿擅自引入称呼“{invented_role}”")
+        return normalized
+
+    @staticmethod
+    def split_review_content(content: str, max_chars: int = 1800) -> list[str]:
+        """Split a long source without dropping or rewriting a single char."""
+        if not content:
+            return []
+        chunks = []
+        start = 0
+        while start < len(content):
+            hard_end = min(len(content), start + max_chars)
+            end = hard_end
+            if hard_end < len(content):
+                window = content[start:hard_end]
+                candidates = [
+                    window.rfind("\n\n"), window.rfind("\n"),
+                    window.rfind("。"), window.rfind("！"), window.rfind("？"),
+                    window.rfind("；"),
+                ]
+                split_at = max(candidates)
+                if split_at >= max_chars // 3:
+                    delimiter_len = 2 if window[split_at:split_at + 2] == "\n\n" else 1
+                    end = start + split_at + delimiter_len
+            chunks.append(content[start:end])
+            start = end
+        return chunks
+
+    async def generate_review_draft(self, content: str) -> dict:
+        """Generate uncached, source-aligned drafts for Dashboard review."""
+        if not self.api_available:
+            raise RuntimeError("脱水 API 不可用，请配置 OMBRE_API_KEY")
+        draft_chunks = []
+        for index, source in enumerate(self.split_review_content(content)):
+            try:
+                raw = await self._api_dehydrate(
+                    source,
+                    prompt=REVIEW_DEHYDRATE_PROMPT,
+                    truncate=False,
+                )
+                parsed = self._parse_dehydration(raw, source=source)
+                draft_chunks.append({"index": index, "source": source, **parsed})
+            except Exception as exc:
+                draft_chunks.append({
+                    "index": index,
+                    "source": source,
+                    "core_facts": [],
+                    "summary": "",
+                    "error": str(exc),
+                })
+        facts = [fact for chunk in draft_chunks for fact in chunk["core_facts"]]
+        summaries = [chunk["summary"] for chunk in draft_chunks if chunk["summary"]]
+        return {
+            "chunks": draft_chunks,
+            "core_facts": facts,
+            "summary": "；".join(summaries),
+            "failed_chunks": sum(1 for chunk in draft_chunks if chunk.get("error")),
+        }
 
     def invalidate_cache(self, content: str):
         """Remove cached summary for specific content (call when bucket content changes)."""
@@ -298,7 +405,14 @@ class Dehydrator:
         # --- 先查缓存 ---
         cached = self._get_cached_summary(content)
         if cached:
-            return self._format_output(cached, metadata)
+            try:
+                parsed = self._parse_dehydration(cached, source=content[:3000])
+                canonical = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+                return self._format_output(canonical, metadata)
+            except ValueError:
+                # Old formal-Flash failures may have cached empty/truncated
+                # output. Ignore it and replace it only after a valid call.
+                logger.warning("Ignoring invalid dehydration cache entry")
 
         # --- API dehydration (no local fallback) ---
         # --- API 脱水（无本地降级）---
@@ -343,23 +457,48 @@ class Dehydrator:
     # API call: dehydration
     # API 调用：脱水压缩
     # ---------------------------------------------------------
-    async def _api_dehydrate(self, content: str) -> str:
+    async def _api_dehydrate(
+        self,
+        content: str,
+        prompt: str = DEHYDRATE_PROMPT,
+        truncate: bool = True,
+    ) -> str:
         """
         Call LLM API for intelligent dehydration (via OpenAI-compatible client).
         调用 LLM API 执行智能脱水。
         """
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": DEHYDRATE_PROMPT},
-                {"role": "user", "content": content[:3000]},
-            ],
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-        )
-        if not response.choices:
-            return ""
-        return response.choices[0].message.content or ""
+        source = content[:3000] if truncate else content
+        last_error = "脱水 API 返回空内容"
+        for attempt in range(2):
+            messages = [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": source},
+            ]
+            if attempt:
+                messages.append({
+                    "role": "user",
+                    "content": f"上一次输出无效：{last_error}。请重新输出完整纯 JSON。",
+                })
+            response = await self._chat_completion(
+                model=self.model,
+                messages=messages,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+            )
+            if not response.choices:
+                last_error = "脱水 API 没有返回候选结果"
+                continue
+            choice = response.choices[0]
+            raw = choice.message.content or ""
+            if choice.finish_reason == "length":
+                last_error = "脱水输出被长度上限截断"
+                continue
+            try:
+                parsed = self._parse_dehydration(raw, source=source)
+                return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+            except ValueError as exc:
+                last_error = str(exc)
+        raise RuntimeError(last_error)
 
     # ---------------------------------------------------------
     # API call: merge
@@ -371,7 +510,7 @@ class Dehydrator:
         调用 LLM API 执行智能合并。
         """
         user_msg = f"旧记忆：\n{old_content[:2000]}\n\n新内容：\n{new_content[:2000]}"
-        response = await self.client.chat.completions.create(
+        response = await self._chat_completion(
             model=self.model,
             messages=[
                 {"role": "system", "content": MERGE_PROMPT},
@@ -510,7 +649,7 @@ class Dehydrator:
         attempt_log = []  # diagnostic trail for this call, only kept on final failure
         for attempt in range(3):
             try:
-                response = await self.client.chat.completions.create(
+                response = await self._chat_completion(
                     model=self.model,
                     messages=[
                         {"role": "system", "content": ANALYZE_PROMPT},
@@ -674,7 +813,7 @@ class Dehydrator:
         Call LLM API for diary organization.
         调用 LLM API 执行日记整理。
         """
-        response = await self.client.chat.completions.create(
+        response = await self._chat_completion(
             model=self.model,
             messages=[
                 {"role": "system", "content": DIGEST_PROMPT},
