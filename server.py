@@ -1161,12 +1161,14 @@ async def hold(
     arousal: float = -1,
     verbatim: bool = False,
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。crave=True存储色色内容,独立池子不参与普通浮现/打标/脱水,只能通过breath(domain="crave")读取,不占用其他记忆的名额。title=可选标题(仅crave模式使用,类似letter_write的title)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。verbatim=True原样保留内容不脱水(适用于操作手册、代码等需要精确保留的内容)。"""
+    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现，必须由你自己提供title作为日记标题)。crave=True存储色色内容,独立池子不参与普通浮现/打标/脱水,只能通过breath(domain="crave")读取,不占用其他记忆的名额。title=feel 必填、crave 可选。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。verbatim=True原样保留内容不脱水(适用于操作手册、代码等需要精确保留的内容)。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
     if not content or not content.strip():
         return "内容为空，无法存储。"
+    if feel and not crave and (not title or not title.strip()):
+        return "feel 需要你自己写一个 title（日记标题）；本次未保存，请补上标题后重试。"
 
     importance = max(1, min(10, importance))
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
@@ -1202,7 +1204,7 @@ async def hold(
             domain=[],
             valence=feel_valence,
             arousal=feel_arousal,
-            name=None,
+            name=(title.strip()[:60] or None) if title else None,
             bucket_type="feel",
         )
         try:
