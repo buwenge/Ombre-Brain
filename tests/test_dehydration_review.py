@@ -173,6 +173,61 @@ async def test_manual_save_overwrites_cache_without_activating(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_manual_save_persists_selected_render_mode(monkeypatch):
+    request = MagicMock()
+    request.path_params = {"bucket_id": "reviewed"}
+    request.json = AsyncMock(return_value={
+        "core_facts": ["我记住了"],
+        "summary": "我记住了这件事",
+        "dehydration_mode": "facts",
+    })
+    monkeypatch.setattr(server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(server.bucket_mgr, "get", AsyncMock(return_value={
+        "id": "reviewed",
+        "metadata": {},
+        "content": "我记住了这件事",
+    }))
+    monkeypatch.setattr(server.dehydrator, "set_manual_summary", MagicMock(return_value="content-hash"))
+    update = AsyncMock(return_value=True)
+    monkeypatch.setattr(server.bucket_mgr, "update", update)
+
+    response = await server.api_dehydrate_preview_save(request)
+
+    assert json.loads(response.body) == {"ok": True}
+    update.assert_awaited_once_with(
+        "reviewed",
+        touch=False,
+        dehydration_edited_hash="content-hash",
+        verbatim=False,
+        dehydration_mode="facts",
+    )
+
+
+@pytest.mark.asyncio
+async def test_manual_save_rejects_invalid_render_mode(monkeypatch):
+    request = MagicMock()
+    request.path_params = {"bucket_id": "reviewed"}
+    request.json = AsyncMock(return_value={
+        "core_facts": ["我记住了"],
+        "summary": "我记住了这件事",
+        "dehydration_mode": "both",
+    })
+    monkeypatch.setattr(server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(server.bucket_mgr, "get", AsyncMock(return_value={
+        "id": "reviewed",
+        "metadata": {},
+        "content": "我记住了这件事",
+    }))
+    cache_write = MagicMock()
+    monkeypatch.setattr(server.dehydrator, "set_manual_summary", cache_write)
+
+    response = await server.api_dehydrate_preview_save(request)
+
+    assert response.status_code == 400
+    cache_write.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_keep_original_does_not_activate(monkeypatch):
     request = MagicMock()
     request.path_params = {"bucket_id": "raw"}

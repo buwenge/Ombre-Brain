@@ -2925,15 +2925,19 @@ async def api_dehydrate_preview_save(request):
     summary = body.get("summary")
     if not isinstance(core_facts, list) or not isinstance(summary, str) or not summary.strip():
         return JSONResponse({"error": "core_facts (list) and summary (non-empty string) required"}, status_code=400)
+    mode = body.get("dehydration_mode")
+    if mode is not None and mode not in ("auto", "facts", "summary"):
+        return JSONResponse({"error": "invalid dehydration_mode"}, status_code=400)
     content = strip_wikilinks(bucket["content"])
     parsed = {"core_facts": [str(f) for f in core_facts], "summary": summary.strip()}
     content_hash = dehydrator.set_manual_summary(content, parsed)
-    updated = await bucket_mgr.update(
-        bucket_id,
-        touch=False,
-        dehydration_edited_hash=content_hash,
-        verbatim=False,
-    )
+    updates = {
+        "dehydration_edited_hash": content_hash,
+        "verbatim": False,
+    }
+    if mode is not None:
+        updates["dehydration_mode"] = mode
+    updated = await bucket_mgr.update(bucket_id, touch=False, **updates)
     if not updated:
         return JSONResponse({"error": "update failed"}, status_code=500)
     return JSONResponse({"ok": True})
@@ -3049,6 +3053,7 @@ async def api_dehydration_review(request):
         "content": content,
         "content_chars": len(content),
         "estimated_tokens": count_tokens_approx(content),
+        "dehydration_mode": meta.get("dehydration_mode", "auto"),
         "cached": parsed,
         "cache_issue": cache_issue,
         "manual_current": bool(meta.get("dehydration_edited_hash")) and (
