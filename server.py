@@ -2127,9 +2127,114 @@ async def api_bucket_update(request):
     })
 
 
+async def _dashboard_readonly_search(query: str, limit: int = 30) -> list[dict]:
+    """Mirror Breath's keyword + vector search without any activation.
+
+    Dashboard editing also needs guaranteed direct lookup by title and bucket
+    ID.  Those direct hits are merged ahead of the normal Breath-style fuzzy
+    ranking and explicit semantic-vector channel, never filtered out by the
+    embedding candidate set.
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+    limit = max(1, min(50, int(limit)))
+
+    async def _vector_results():
+        if not embedding_engine or not getattr(embedding_engine, "enabled", False):
+            return []
+        try:
+            return await embedding_engine.search_similar(query, top_k=max(limit, 20))
+        except Exception as exc:
+            logger.warning(f"Dashboard vector search failed, using text only: {exc}")
+            return []
+
+    all_buckets, keyword_matches, vector_results = await asyncio.gather(
+        bucket_mgr.list_all(include_archive=False),
+        bucket_mgr.search(
+            query,
+            limit=max(limit, 20),
+            use_embedding_prefilter=False,
+        ),
+        _vector_results(),
+    )
+    eligible = {
+        bucket["id"]: bucket
+        for bucket in all_buckets
+        if bucket.get("metadata", {}).get("type") not in ("feel", "letter", "crave")
+    }
+    records = {}
+
+    def add(bucket_id: str, reason: str, rank: tuple, score: float, vector_similarity=None):
+        bucket = eligible.get(bucket_id)
+        if not bucket:
+            return
+        current = records.get(bucket_id)
+        if current is None:
+            current = {
+                "bucket": bucket,
+                "reasons": [],
+                "rank": rank,
+                "score": score,
+                "vector_similarity": None,
+            }
+            records[bucket_id] = current
+        else:
+            current["rank"] = min(current["rank"], rank)
+            current["score"] = max(current["score"], score)
+        if reason not in current["reasons"]:
+            current["reasons"].append(reason)
+        if vector_similarity is not None:
+            current["vector_similarity"] = vector_similarity
+
+    lowered = query.casefold()
+    direct_hits = []
+    for bucket_id, bucket in eligible.items():
+        name = str(bucket.get("metadata", {}).get("name") or bucket_id)
+        bid_lower = bucket_id.casefold()
+        name_lower = name.casefold()
+        if bid_lower == lowered:
+            direct_hits.append((0, bucket_id, "桶ID", 100.0))
+        elif bid_lower.startswith(lowered):
+            direct_hits.append((1, bucket_id, "桶ID", 99.0))
+        elif lowered in bid_lower:
+            direct_hits.append((2, bucket_id, "桶ID", 98.0))
+        if name_lower == lowered:
+            direct_hits.append((3, bucket_id, "标题", 100.0))
+        elif lowered in name_lower:
+            direct_hits.append((4, bucket_id, "标题", 97.0))
+    direct_hits.sort(key=lambda item: (item[0], item[1]))
+    for order, (_, bucket_id, reason, score) in enumerate(direct_hits):
+        add(bucket_id, reason, (0, order), score)
+
+    for order, match in enumerate(keyword_matches):
+        add(match["id"], "关键词", (1, order), float(match.get("score", 0) or 0))
+
+    for order, (bucket_id, similarity) in enumerate(vector_results):
+        if similarity > 0.5:
+            add(
+                bucket_id,
+                "语义向量",
+                (2, order),
+                round(float(similarity) * 100, 2),
+                vector_similarity=round(float(similarity), 4),
+            )
+
+    ordered = sorted(records.values(), key=lambda item: item["rank"])
+    results = []
+    for record in ordered[:limit]:
+        bucket = record["bucket"]
+        copied = dict(bucket)
+        copied["score"] = round(record["score"], 2)
+        copied["match_reasons"] = record["reasons"]
+        copied["vector_similarity"] = record["vector_similarity"]
+        results.append(copied)
+    return results
+
+
 @mcp.custom_route("/api/search", methods=["GET"])
 async def api_search(request):
-    """Search buckets by query."""
+    """Read-only Dashboard search; never touch or soft-touch a bucket."""
     from starlette.responses import JSONResponse
     err = _require_auth(request)
     if err: return err
@@ -2137,7 +2242,11 @@ async def api_search(request):
     if not query:
         return JSONResponse({"error": "missing q parameter"}, status_code=400)
     try:
-        matches = await bucket_mgr.search(query, limit=10)
+        try:
+            limit = int(request.query_params.get("limit", "30"))
+        except ValueError:
+            return JSONResponse({"error": "invalid limit"}, status_code=400)
+        matches = await _dashboard_readonly_search(query, limit=limit)
         result = []
         for b in matches:
             meta = b.get("metadata", {})
@@ -2159,6 +2268,8 @@ async def api_search(request):
                 "activation_count": meta.get("activation_count", 1),
                 "score": b.get("score", 0) or decay_engine.calculate_score(meta),
                 "content_preview": strip_wikilinks(b.get("content", ""))[:200],
+                "match_reasons": b.get("match_reasons", []),
+                "vector_similarity": b.get("vector_similarity"),
             })
         return JSONResponse(result)
     except Exception as e:
