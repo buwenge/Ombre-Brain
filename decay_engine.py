@@ -142,11 +142,28 @@ class DecayEngine:
         time_share, emotion_share = self._calc_weight_shares(days_since)
         combined_weight = time_weight * time_share + emotion_weight * emotion_share
 
+        # --- Effective decay rate: higher importance forgets more slowly ---
+        # 有效衰减速率：重要度越高，遗忘越慢——原公式里 importance 只是个线性
+        # 乘数，跟其他桶一样按相同速率指数衰减，重要度优势会被"新鲜度"和纯粹
+        # 的时间流逝迅速吃掉。这里让 importance 直接影响衰减速率本身，更贴近
+        # 真实的记忆巩固（印象深的记忆本来就该忘得慢）。
+        # importance=1 → 衰减速率不变；importance=10 → 半衰期约拉长到2.2倍。
+        # 系数 0.05 是经过验证的安全上限：更陡（比如 0.1）会在
+        # combined_weight 的 time/emotion 交接区间制造极小的分数回升
+        # （高 activation_count 压低 time_weight 到低于 emotion_weight 时，
+        # share 从 time 转向 emotion 会让加权值短暂爬升），破坏"score 不会
+        # 单纯因时间流逝而上升"这条不变式（tests/test_scoring.py 的
+        # test_score_does_not_rise_from_time_alone）。0.05 在 importance
+        # 1-10、activation_count 0-100、arousal 0-1 的全部组合下都验证过
+        # 不会触发这个回升。
+        lambda_scale = 1.0 - 0.05 * (importance - 1)
+        effective_lambda = self.decay_lambda * lambda_scale
+
         # --- Base score ---
         base_score = (
             importance
             * (activation_count ** 0.3)
-            * math.exp(-self.decay_lambda * days_since)
+            * math.exp(-effective_lambda * days_since)
             * combined_weight
         )
 

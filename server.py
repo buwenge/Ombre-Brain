@@ -335,6 +335,8 @@ async def health_check(request):
 # 会话启动专用挂载点
 # =============================================================
 DREAM_RECENT_LIMIT = 10
+IMPORTANCE_FLOOR_SLOTS = 3
+IMPORTANCE_FLOOR_MIN_IMPORTANCE = 8
 
 
 def _select_dream_recent(all_buckets: list[dict], limit: int = DREAM_RECENT_LIMIT) -> list[dict]:
@@ -355,6 +357,36 @@ def _select_dream_recent(all_buckets: list[dict], limit: int = DREAM_RECENT_LIMI
     ]
     candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
     return candidates[:limit]
+
+
+def _select_importance_floor(
+    scored_deduped: list[dict],
+    top_window: int = 20,
+    slots: int = IMPORTANCE_FLOOR_SLOTS,
+    min_importance: int = IMPORTANCE_FLOOR_MIN_IMPORTANCE,
+) -> list[dict]:
+    """Randomly reserve a few slots for high-importance buckets stuck below the
+    normal top-N score window.
+
+    Scaling decay by importance (decay_engine.py) helps but can't fully fix
+    coverage alone — when 40-50+ buckets score importance>=min_importance,
+    they all compete for the same ~20 slots every single breath call, so a
+    fixed score cutoff still permanently buries most of them. This swaps in a
+    random sample each call so long-run, every important memory gets
+    occasional coverage instead of only the same top-ranked handful ever
+    surfacing. Shared by breath() and its dashboard simulator so both stay in
+    sync.
+    重要度保底：给排在前N名窗口之外的高重要度记忆留几个随机轮换槽位。单靠调
+    衰减公式治标不治本——库里 importance>=min_importance 的桶动辄四五十条，
+    怎么排都挤不进固定的~20个槽位。这里每次随机抽几个，长期靠概率覆盖，而
+    不是永远只有排名最前的那几条被看到。breath() 和 dashboard 模拟器共用，
+    避免两处逻辑各自维护走样。
+    """
+    pool = [
+        b for b in scored_deduped[top_window:]
+        if int(b["metadata"].get("importance", 0)) >= min_importance
+    ]
+    return random.sample(pool, min(slots, len(pool)))
 
 
 def _weight_rank_snapshot(all_buckets: list[dict]) -> tuple[list[dict], dict[str, int], dict[str, float]]:
@@ -923,6 +955,10 @@ async def breath(
         cold_start_ids = {b["id"] for b in cold_start}
         # Merge: cold_start first, then scored (excluding duplicates)
         scored_deduped = [b for b in scored if b["id"] not in cold_start_ids]
+
+        importance_floor_picks = _select_importance_floor(scored_deduped)
+        importance_floor_ids = {b["id"] for b in importance_floor_picks}
+
         scored_with_cold = cold_start + scored_deduped
 
         # --- Token-budgeted surfacing with diversity + hard cap ---
@@ -943,6 +979,15 @@ async def breath(
                 random.shuffle(pool)
                 non_cold = top1 + pool + non_cold[min(20, len(non_cold)):]
             candidates = cold_start + non_cold
+
+        # Splice in importance-floor lottery picks, displacing the weakest
+        # tail of the normal ranking rather than growing the total count.
+        # 插入重要度保底抽签位，顶替正常排名末尾，不增加总条数。
+        if importance_floor_picks:
+            candidates = [b for b in candidates if b["id"] not in importance_floor_ids]
+            insert_at = max(0, len(candidates) - len(importance_floor_picks))
+            candidates = candidates[:insert_at] + importance_floor_picks + candidates[insert_at:]
+
         # Hard cap: never surface more than max_results buckets
         candidates = candidates[:max_results]
 
@@ -955,6 +1000,7 @@ async def breath(
                 breath_rank=breath_ranks.get(b["id"]),
                 candidate_position=index,
                 cold_start=b["id"] in cold_start_ids,
+                importance_floor=b["id"] in importance_floor_ids,
                 outcome="selected",
             )
             for index, b in enumerate(candidates, start=1)
@@ -2779,6 +2825,10 @@ async def api_simulate_breath(request):
     ][:2]
     cold_start_ids = {b["id"] for b in cold_start}
     scored_deduped = [b for b in scored if b["id"] not in cold_start_ids]
+
+    importance_floor_picks = _select_importance_floor(scored_deduped)
+    importance_floor_ids = {b["id"] for b in importance_floor_picks}
+
     candidates = cold_start + scored_deduped
 
     if len(candidates) > 1:
@@ -2790,6 +2840,11 @@ async def api_simulate_breath(request):
             random.shuffle(pool)
             non_cold = top1 + pool + non_cold[min(20, len(non_cold)):]
         candidates = cold_start + non_cold
+
+    if importance_floor_picks:
+        candidates = [b for b in candidates if b["id"] not in importance_floor_ids]
+        insert_at = max(0, len(candidates) - len(importance_floor_picks))
+        candidates = candidates[:insert_at] + importance_floor_picks + candidates[insert_at:]
 
     chosen = candidates[:max_results]
     beyond_cap = candidates[max_results:]
@@ -2831,7 +2886,12 @@ async def api_simulate_breath(request):
             stopped = True
             continue
         token_budget -= summary_tokens
-        channel = "cold_start" if b["id"] in cold_start_ids else "dynamic"
+        if b["id"] in cold_start_ids:
+            channel = "cold_start"
+        elif b["id"] in importance_floor_ids:
+            channel = "importance_floor"
+        else:
+            channel = "dynamic"
         surfaced.append(_sim_row(b, score_of(b), channel=channel, summary=summary))
 
     not_surfaced.sort(key=lambda r: r["score"] if r["score"] is not None else -1, reverse=True)
