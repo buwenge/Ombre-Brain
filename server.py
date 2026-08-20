@@ -714,29 +714,51 @@ async def breath(
     bucket_id: str = "",
     limit: int = -1,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制浮现模式返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。bucket_id传入桶ID时直接获取该桶内容返回(不走搜索)。limit>=1时在关键词搜索模式下限制返回条数(不填则返回所有匹配结果)。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制浮现模式返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。bucket_id传入桶ID时直接获取该桶内容返回(不走搜索),支持逗号分隔多个ID一次批量获取,受max_tokens预算限制,超预算的后续ID不会获取。limit>=1时在关键词搜索模式下限制返回条数(不填则返回所有匹配结果)。"""
     decay_engine.relationship_clock.resume("breath")
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
 
-    # --- bucket_id mode: fetch single bucket by ID ---
-    # --- 桶ID模式：直接按ID获取单个桶 ---
+    # --- bucket_id mode: fetch one or more buckets by ID (comma-separated) ---
+    # --- 桶ID模式：直接按ID获取一个或多个桶（逗号分隔支持批量），受max_tokens预算限制 ---
     if bucket_id and bucket_id.strip():
-        try:
-            bucket = await bucket_mgr.get(bucket_id.strip())
-            if not bucket:
-                return f"未找到桶 {bucket_id}"
-            clean_meta = {k: v for k, v in bucket["metadata"].items() if k != "tags"}
-            is_verbatim = bucket["metadata"].get("verbatim", False)
-            if is_verbatim:
-                clean_meta["verbatim"] = True
-            summary = await dehydrator.dehydrate(strip_wikilinks(bucket["content"]), clean_meta)
-            await bucket_mgr.touch(bucket["id"])
-            return f"[bucket_id:{bucket['id']}] {summary}"
-        except Exception as e:
-            logger.error(f"Bucket ID fetch failed / 桶ID获取失败: {e}")
-            return f"获取桶 {bucket_id} 失败: {e}"
+        ids = []
+        for part in bucket_id.split(","):
+            part = part.strip()
+            if part and part not in ids:
+                ids.append(part)
+        results = []
+        missing = []
+        token_used = 0
+        for bid in ids:
+            if token_used >= max_tokens:
+                break
+            try:
+                bucket = await bucket_mgr.get(bid)
+                if not bucket:
+                    missing.append(bid)
+                    continue
+                clean_meta = {k: v for k, v in bucket["metadata"].items() if k != "tags"}
+                is_verbatim = bucket["metadata"].get("verbatim", False)
+                if is_verbatim:
+                    clean_meta["verbatim"] = True
+                summary = await dehydrator.dehydrate(strip_wikilinks(bucket["content"]), clean_meta)
+                t = count_tokens_approx(summary)
+                if token_used + t > max_tokens:
+                    break
+                await bucket_mgr.touch(bucket["id"])
+                results.append(f"[bucket_id:{bucket['id']}] {summary}")
+                token_used += t
+            except Exception as e:
+                logger.error(f"Bucket ID fetch failed / 桶ID获取失败: {bid}: {e}")
+                missing.append(bid)
+        if not results and missing:
+            return f"未找到桶: {', '.join(missing)}"
+        output = "\n---\n".join(results)
+        if missing:
+            output += f"\n---\n未找到/获取失败: {', '.join(missing)}"
+        return output
 
     # --- importance_min mode: bulk fetch by importance threshold ---
     # --- 重要度批量拉取模式：跳过语义搜索，按 importance 降序返回 ---
