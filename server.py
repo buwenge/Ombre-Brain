@@ -3138,19 +3138,25 @@ def _dehydration_queue_rows(
         if edited_hash == content_hash:
             continue
         created = str(meta.get("created") or "")
+        # content_modified only exists on buckets created/edited after this field
+        # was introduced; older buckets fall back to created. Scope filtering must
+        # key off this, not created — trace()/dashboard edits refresh content on
+        # buckets with arbitrarily old created dates, and those edits are exactly
+        # what should pull a bucket back into review.
+        effective = str(meta.get("content_modified") or created)
         try:
-            created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            effective_dt = datetime.fromisoformat(effective.replace("Z", "+00:00"))
             # Browser getTimezoneOffset is UTC - local (China = -480).
             # Bucket timestamps are currently server-local naive timestamps;
             # production runs in UTC, so translate them to the reviewer's day.
-            if created_dt.tzinfo is not None:
-                created_dt = created_dt.astimezone(timezone.utc).replace(tzinfo=None)
-            created_date = (created_dt - timedelta(minutes=timezone_offset_minutes)).date()
+            if effective_dt.tzinfo is not None:
+                effective_dt = effective_dt.astimezone(timezone.utc).replace(tzinfo=None)
+            effective_date = (effective_dt - timedelta(minutes=timezone_offset_minutes)).date()
         except (ValueError, TypeError):
-            created_date = None
-        if scope == "today" and created_date != today:
+            effective_date = None
+        if scope == "today" and effective_date != today:
             continue
-        if scope == "week" and (created_date is None or created_date < oldest or created_date > today):
+        if scope == "week" and (effective_date is None or effective_date < oldest or effective_date > today):
             continue
         rows.append({
             "id": bucket["id"],
@@ -3158,12 +3164,13 @@ def _dehydration_queue_rows(
             "type": meta.get("type", "dynamic"),
             "domain": meta.get("domain", []),
             "created": created,
+            "content_modified": effective,
             "content_chars": len(content),
             "estimated_tokens": count_tokens_approx(content),
             "content_preview": content[:160],
             "stale_manual": bool(edited_hash),
         })
-    rows.sort(key=lambda row: row["created"], reverse=True)
+    rows.sort(key=lambda row: row["content_modified"], reverse=True)
     return rows
 
 

@@ -170,6 +170,7 @@ class BucketManager:
             "importance": max(1, min(10, importance)),
             "type": bucket_type,
             "created": now_iso(),
+            "content_modified": now_iso(),
             "last_active": now_iso(),
             "activation_count": 0,
         }
@@ -301,6 +302,7 @@ class BucketManager:
         # --- Update only fields that were passed in / 只改传入的字段 ---
         if "content" in kwargs:
             post.content = kwargs["content"]  # wikilink injection disabled; LLM adds [[]] via prompt
+            post["content_modified"] = now_iso()
         if "tags" in kwargs:
             post["tags"] = kwargs["tags"]
         if "importance" in kwargs:
