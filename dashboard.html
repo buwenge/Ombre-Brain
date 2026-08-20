@@ -1016,13 +1016,25 @@ async function checkAuth() {
       document.getElementById('auth-setup-form').style.display = 'block';
     } else if (data.authenticated) {
       document.getElementById('auth-overlay').style.display = 'none';
+      initDashboardData();
     } else {
       document.getElementById('auth-subtitle').textContent = '请输入访问密码';
       document.getElementById('auth-login-form').style.display = 'block';
     }
   } catch {
+    // /auth/status itself unreachable — fail open so the dashboard isn't
+    // permanently stuck if auth is misconfigured; the underlying API calls
+    // will still 401 and prompt login via authFetch if actually needed.
     document.getElementById('auth-overlay').style.display = 'none';
+    initDashboardData();
   }
+}
+
+// Only ever called once we know (or the /auth/status check itself failed
+// open) that the session is usable — never race data loads ahead of login.
+function initDashboardData() {
+  loadBuckets();
+  loadFreezeStatus();
 }
 
 function showAuthError(msg) {
@@ -1039,7 +1051,7 @@ async function doSetup() {
   const resp = await fetch('/auth/setup', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: p1}) });
   if (resp.ok) {
     document.getElementById('auth-overlay').style.display = 'none';
-    loadFreezeStatus();
+    initDashboardData();
   } else {
     const d = await resp.json();
     showAuthError(d.detail || '设置失败');
@@ -1051,7 +1063,7 @@ async function doLogin() {
   const resp = await fetch('/auth/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: pwd}) });
   if (resp.ok) {
     document.getElementById('auth-overlay').style.display = 'none';
-    loadFreezeStatus();
+    initDashboardData();
   } else {
     const d = await resp.json();
     showAuthError(d.detail || '密码错误');
@@ -1254,7 +1266,8 @@ document.getElementById('search-input').addEventListener('input', function(e) {
 
 async function loadBuckets() {
   try {
-    const res = await fetch(BASE + '/api/buckets');
+    const res = await authFetch(BASE + '/api/buckets');
+    if (!res) return;
     const data = await res.json();
     if (!res.ok || !Array.isArray(data)) {
       throw new Error((data && data.error) ? data.error : `HTTP ${res.status}`);
@@ -2215,10 +2228,7 @@ async function saveConfig(persist) {
   }
 }
 
-checkAuth().then(() => {
-  loadBuckets();
-  loadFreezeStatus();
-});
+checkAuth();
 
 // --- Import functions ---
 const uploadZone = document.getElementById('import-upload-zone');
