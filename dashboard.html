@@ -324,6 +324,7 @@
     margin-bottom: 16px;
     letter-spacing: 0.3px;
   }
+  .ss-hint { font-size: 11px; color: var(--text-light); margin-left: 10px; white-space: nowrap; }
   .config-row {
     display: flex;
     align-items: center;
@@ -974,6 +975,40 @@
     </div>
 
     <div class="config-section">
+      <h3>浮现上限</h3>
+      <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px;line-height:1.6;">
+        小予不带参数调用 breath() / dream() 时用这里的上限；保存后下一次调用就生效，重启不丢。
+        breath 的桶数只算普通桶，钉选桶不占名额但会先扣 token；dream 只算普通记忆桶，feel / crave 不在内。
+      </div>
+      <div class="config-row">
+        <label>breath 桶数</label>
+        <input type="number" id="ss-breath-results" min="1" max="50" style="width:120px;" />
+        <span class="ss-hint" id="ss-hint-breath-results"></span>
+      </div>
+      <div class="config-row">
+        <label>breath token</label>
+        <input type="number" id="ss-breath-tokens" min="500" max="20000" step="500" style="width:120px;" />
+        <span class="ss-hint" id="ss-hint-breath-tokens"></span>
+      </div>
+      <div class="config-row">
+        <label>dream 桶数</label>
+        <input type="number" id="ss-dream-results" min="1" max="50" style="width:120px;" />
+        <span class="ss-hint" id="ss-hint-dream-results"></span>
+      </div>
+      <div class="config-row">
+        <label>dream token</label>
+        <input type="number" id="ss-dream-tokens" min="500" max="50000" step="500" style="width:120px;" />
+        <span class="ss-hint" id="ss-hint-dream-tokens"></span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:6px;">
+        <button class="btn-primary" onclick="saveSurfaceSettings()">保存上限</button>
+        <button onclick="loadSurfaceSettings()" style="font-size:12px;padding:4px 12px;">刷新</button>
+        <span id="ss-msg" style="font-size:12px;"></span>
+      </div>
+      <div id="ss-last" style="margin-top:14px;font-size:13px;color:var(--text-dim);line-height:1.9;">加载中…</div>
+    </div>
+
+    <div class="config-section">
       <h3>账号操作</h3>
       <button onclick="doLogout()" style="color:var(--negative);border-color:var(--negative);">退出登录</button>
     </div>
@@ -1122,6 +1157,82 @@ async function loadSettingsStatus() {
   }
   // Also refresh the host-vault input whenever the settings tab is loaded.
   loadHostVault();
+  loadSurfaceSettings();
+}
+
+const SURFACE_SETTING_INPUTS = {
+  breath_max_results: 'ss-breath-results',
+  breath_max_tokens: 'ss-breath-tokens',
+  dream_max_results: 'ss-dream-results',
+  dream_max_tokens: 'ss-dream-tokens',
+};
+
+function formatSurfaceTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0') +
+    ' ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+
+function renderLastSurface(last) {
+  const b = last.breath, d = last.dream;
+  const breathLine = b
+    ? `<b>上次 breath</b>（${formatSurfaceTime(b.timestamp)}）：共 ${b.returned_count} 桶 = 钉选 ${b.pinned_returned_count} + 普通 ${b.dynamic_returned_count}；` +
+      `占预算约 ${b.used_tokens} token（脱水正文：钉选 ${b.pinned_tokens} / 普通 ${b.dynamic_tokens}，前缀另计）；当时上限 ${b.max_results} 桶 / ${b.max_tokens} token`
+    : '<b>上次 breath</b>：还没有记录';
+  const dreamLine = d
+    ? `<b>上次 dream</b>（${formatSurfaceTime(d.timestamp)}）：${d.returned_count} 桶` +
+      (d.max_tokens ? `，用了约 ${d.used_tokens} token；当时上限 ${d.max_results} 桶 / ${d.max_tokens} token`
+                    : `；当时上限 ${d.max_results} 桶（这条是旧记录，没有 token 数据）`)
+    : '<b>上次 dream</b>：还没有记录';
+  document.getElementById('ss-last').innerHTML = breathLine + '<br>' + dreamLine;
+}
+
+async function loadSurfaceSettings() {
+  const msg = document.getElementById('ss-msg');
+  if (!msg) return;
+  try {
+    const resp = await authFetch(BASE + '/api/surface-settings');
+    if (!resp) return;
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+    for (const key in SURFACE_SETTING_INPUTS) {
+      document.getElementById(SURFACE_SETTING_INPUTS[key]).value = data.settings[key];
+      const lim = data.limits[key];
+      document.getElementById('ss-hint-' + SURFACE_SETTING_INPUTS[key].slice(3)).textContent =
+        lim.min + '～' + lim.max + '，默认 ' + data.defaults[key];
+    }
+    renderLastSurface(data.last || {});
+    msg.textContent = '';
+  } catch (e) {
+    msg.textContent = '加载失败: ' + e.message;
+    msg.style.color = 'var(--negative)';
+  }
+}
+
+async function saveSurfaceSettings() {
+  const msg = document.getElementById('ss-msg');
+  const body = {};
+  for (const key in SURFACE_SETTING_INPUTS) {
+    const v = parseInt(document.getElementById(SURFACE_SETTING_INPUTS[key]).value, 10);
+    if (isNaN(v)) { msg.textContent = '有一项不是数字'; msg.style.color = 'var(--negative)'; return; }
+    body[key] = v;
+  }
+  try {
+    const resp = await authFetch(BASE + '/api/surface-settings', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    });
+    if (!resp) return;
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+    msg.textContent = '已保存，下一次 breath / dream 生效';
+    msg.style.color = 'var(--positive)';
+    loadSurfaceSettings();
+  } catch (e) {
+    msg.textContent = '保存失败: ' + e.message;
+    msg.style.color = 'var(--negative)';
+  }
 }
 
 async function loadHostVault() {

@@ -58,6 +58,7 @@ from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from surface_audit import SurfaceAuditLog
+from surface_settings import SurfaceSettings
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, get_ai_name
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -112,6 +113,7 @@ bucket_mgr.set_activation_callback(
 )
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 surface_audit = SurfaceAuditLog(config["buckets_dir"], max_events=50)
+surface_settings = SurfaceSettings(config["buckets_dir"])  # Dashboard-editable breath/dream caps
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # OMBRE_BIND_HOST defaults to 0.0.0.0 so Docker SSE remains externally reachable.
@@ -334,21 +336,49 @@ async def health_check(request):
 # /breath-hook endpoint: Dedicated hook for SessionStart
 # 会话启动专用挂载点
 # =============================================================
-DREAM_RECENT_LIMIT = 10
 IMPORTANCE_FLOOR_SLOTS = 3
 IMPORTANCE_FLOOR_MIN_IMPORTANCE = 8
+DREAM_CONTENT_CHARS = 500
 
 
-def _select_dream_recent(all_buckets: list[dict], limit: int = DREAM_RECENT_LIMIT) -> list[dict]:
+def _render_dream_part(b: dict) -> str:
+    """The exact text dream() emits for one bucket (also used for token accounting)."""
+    meta = b["metadata"]
+    resolved_tag = " [已解决]" if meta.get("resolved", False) else " [未解决]"
+    domains = ",".join(meta.get("domain", []))
+    val = meta.get("valence", 0.5)
+    aro = meta.get("arousal", 0.3)
+    created = meta.get("created", "")
+    return (
+        f"[{meta.get('name', b['id'])}]{resolved_tag} "
+        f"主题:{domains} V{val:.1f}/A{aro:.1f} "
+        f"创建:{created}\n"
+        f"ID: {b['id']}\n"
+        f"{strip_wikilinks(b['content'][:DREAM_CONTENT_CHARS])}"
+    )
+
+
+def _select_dream_recent(
+    all_buckets: list[dict],
+    limit: int | None = None,
+    max_tokens: int | None = None,
+) -> list[dict]:
     """Return the newest surface-level memories reserved for Dreaming.
 
     Both breath paths call this before weight ranking so the same memories are
     not injected twice during startup.  dream() and /dream-hook use this exact
     helper as well, keeping the reservation deterministic without shared
-    per-session state.
+    per-session state.  Count and token caps default to the Dashboard settings;
+    the token cap is applied here (not only in dream()) so breath never reserves
+    a bucket that dream would then drop for budget reasons.
     返回留给 Dreaming 的最新表层记忆。breath 与 dream 共用同一筛选函数，
-    无需跨调用状态也能避免一次开窗重复注入。
+    无需跨调用状态也能避免一次开窗重复注入。条数/token 上限默认取 Dashboard
+    设置；token 上限在这里就截断，保证 breath 预留的和 dream 真正输出的一致。
     """
+    if limit is None:
+        limit = surface_settings.get("dream_max_results")
+    if max_tokens is None:
+        max_tokens = surface_settings.get("dream_max_tokens")
     candidates = [
         b for b in all_buckets
         if b["metadata"].get("type") not in ("permanent", "feel", "letter", "crave")
@@ -356,7 +386,15 @@ def _select_dream_recent(all_buckets: list[dict], limit: int = DREAM_RECENT_LIMI
         and not b["metadata"].get("protected", False)
     ]
     candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
-    return candidates[:limit]
+    picked = []
+    budget = max_tokens
+    for b in candidates[:limit]:
+        cost = count_tokens_approx(_render_dream_part(b))
+        if cost > budget:
+            break
+        budget -= cost
+        picked.append(b)
+    return picked
 
 
 def _select_importance_floor(
@@ -459,7 +497,9 @@ async def breath_hook(request):
         breath_ranks = {b["id"]: index for index, b in enumerate(scored, start=1)}
 
         parts = []
-        token_budget = 10000
+        hook_max_results = surface_settings.get("breath_max_results")
+        hook_max_tokens = surface_settings.get("breath_max_tokens")
+        token_budget = hook_max_tokens
         for b in pinned:
             entry = _audit_bucket_entry(b, channel="pin", outcome="selected")
             summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
@@ -480,8 +520,8 @@ async def breath_hook(request):
             pool = candidates[1:min(20, len(candidates))]
             random.shuffle(pool)
             candidates = top1 + pool + candidates[min(20, len(candidates)):]
-        # Hard cap: max 20 surfacing buckets in hook
-        candidates = candidates[:20]
+        # Hard cap: dashboard-configured number of dynamic buckets in hook
+        candidates = candidates[:hook_max_results]
 
         candidate_entries = []
         for index, b in enumerate(candidates, start=1):
@@ -541,8 +581,8 @@ async def breath_hook(request):
             returned_count=len(parts),
             pinned_returned_count=len(parts) - dynamic_returned,
             dynamic_returned_count=dynamic_returned,
-            max_results=20,
-            max_tokens=10000,
+            max_results=hook_max_results,
+            max_tokens=hook_max_tokens,
             remaining_tokens=token_budget,
             status="complete",
         )
@@ -705,18 +745,24 @@ async def _merge_or_create(
 @mcp.tool()
 async def breath(
     query: str = "",
-    max_tokens: int = 10000,
+    max_tokens: int = -1,
     domain: str = "",
     valence: float = -1,
     arousal: float = -1,
-    max_results: int = 20,
+    max_results: int = -1,
     importance_min: int = -1,
     bucket_id: str = "",
     limit: int = -1,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制浮现模式返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。bucket_id传入桶ID时直接获取该桶内容返回(不走搜索),支持逗号分隔多个ID一次批量获取,受max_tokens预算限制,超预算的后续ID不会获取。limit>=1时在关键词搜索模式下限制返回条数(不填则返回所有匹配结果)。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(不填=Dashboard设置的默认值,通常10000,最大20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制浮现模式返回数量上限(不填=Dashboard设置的默认值,通常20,最大50;钉选桶不计入)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。bucket_id传入桶ID时直接获取该桶内容返回(不走搜索),支持逗号分隔多个ID一次批量获取,受max_tokens预算限制,超预算的后续ID不会获取。limit>=1时在关键词搜索模式下限制返回条数(不填则返回所有匹配结果)。"""
     decay_engine.relationship_clock.resume("breath")
     await decay_engine.ensure_started()
+    # -1 / 0 = caller didn't choose: fall back to the Dashboard-configured caps.
+    # 不传或传 -1 = 用 Dashboard 设置的上限。
+    if max_results < 1:
+        max_results = surface_settings.get("breath_max_results")
+    if max_tokens < 1:
+        max_tokens = surface_settings.get("breath_max_tokens")
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
 
@@ -1728,11 +1774,15 @@ async def dream() -> str:
 
     # --- Same deterministic reservation used by both breath paths ---
     # --- 与两条 breath 路径共用同一组确定性的最新记忆 ---
-    recent = _select_dream_recent(all_buckets)
+    dream_max_results = surface_settings.get("dream_max_results")
+    dream_max_tokens = surface_settings.get("dream_max_tokens")
+    recent = _select_dream_recent(all_buckets, dream_max_results, dream_max_tokens)
 
     if not recent:
         _record_surface_audit(
-            "dream", [], total_buckets=len(all_buckets), returned_count=0, status="complete"
+            "dream", [], total_buckets=len(all_buckets), returned_count=0,
+            max_results=dream_max_results, max_tokens=dream_max_tokens,
+            remaining_tokens=dream_max_tokens, status="complete",
         )
         return "没有需要消化的新记忆。"
 
@@ -1742,21 +1792,8 @@ async def dream() -> str:
         logger.warning("Dream rank snapshot failed: %s", type(exc).__name__)
         ranked, weight_ranks, score_snapshot = [], {}, {}
 
-    parts = []
-    for b in recent:
-        meta = b["metadata"]
-        resolved_tag = " [已解决]" if meta.get("resolved", False) else " [未解决]"
-        domains = ",".join(meta.get("domain", []))
-        val = meta.get("valence", 0.5)
-        aro = meta.get("arousal", 0.3)
-        created = meta.get("created", "")
-        parts.append(
-            f"[{meta.get('name', b['id'])}]{resolved_tag} "
-            f"主题:{domains} V{val:.1f}/A{aro:.1f} "
-            f"创建:{created}\n"
-            f"ID: {b['id']}\n"
-            f"{strip_wikilinks(b['content'][:500])}"
-        )
+    parts = [_render_dream_part(b) for b in recent]
+    part_tokens = [count_tokens_approx(part) for part in parts]
 
     header = (
         "=== Dreaming ===\n"
@@ -1843,6 +1880,7 @@ async def dream() -> str:
                 weight_rank=weight_ranks.get(b["id"]),
                 newest_position=index,
                 output_position=index,
+                summary_tokens=part_tokens[index - 1],
                 outcome="surfaced",
             )
             for index, b in enumerate(recent, start=1)
@@ -1851,7 +1889,9 @@ async def dream() -> str:
         dynamic_pool_count=len(ranked),
         candidate_count=len(recent),
         returned_count=len(recent),
-        max_results=DREAM_RECENT_LIMIT,
+        max_results=dream_max_results,
+        max_tokens=dream_max_tokens,
+        remaining_tokens=dream_max_tokens - sum(part_tokens),
         status="complete",
     )
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
@@ -2788,11 +2828,13 @@ async def api_simulate_breath(request):
     from starlette.responses import JSONResponse
     err = _require_auth(request)
     if err: return err
+    default_results = surface_settings.get("breath_max_results")
+    default_tokens = surface_settings.get("breath_max_tokens")
     try:
-        max_results = min(int(request.query_params.get("max_results", 20)), 50)
-        max_tokens = min(int(request.query_params.get("max_tokens", 10000)), 20000)
+        max_results = min(int(request.query_params.get("max_results", default_results)), 50)
+        max_tokens = min(int(request.query_params.get("max_tokens", default_tokens)), 20000)
     except (TypeError, ValueError):
-        max_results, max_tokens = 20, 10000
+        max_results, max_tokens = default_results, default_tokens
 
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
@@ -3321,6 +3363,89 @@ async def dashboard(request):
             return HTMLResponse(f.read())
     except FileNotFoundError:
         return HTMLResponse("<h1>dashboard.html not found</h1>", status_code=404)
+
+
+def _summarize_surface_event(event: dict) -> dict:
+    """Collapse one audit event into the numbers the settings panel shows."""
+    pinned_tokens = 0
+    other_tokens = 0
+    for entry in event.get("entries", []):
+        if entry.get("outcome") != "surfaced":
+            continue
+        tokens = int(entry.get("summary_tokens") or 0)
+        if entry.get("channel") == "pin":
+            pinned_tokens += tokens
+        else:
+            other_tokens += tokens
+    max_tokens = event.get("max_tokens")
+    remaining = event.get("remaining_tokens")
+    used = pinned_tokens + other_tokens
+    if isinstance(max_tokens, (int, float)) and isinstance(remaining, (int, float)):
+        used = int(max_tokens - remaining)
+    return {
+        "timestamp": event.get("timestamp"),
+        "returned_count": event.get("returned_count", 0),
+        "pinned_returned_count": event.get("pinned_returned_count", 0),
+        "dynamic_returned_count": event.get("dynamic_returned_count", event.get("returned_count", 0)),
+        "pinned_tokens": pinned_tokens,
+        "dynamic_tokens": other_tokens,
+        "used_tokens": used,
+        "max_results": event.get("max_results"),
+        "max_tokens": max_tokens,
+    }
+
+
+def _last_surface_stats(events: list[dict]) -> dict:
+    """Newest breath / dream event (events are newest-first, as recent() returns)."""
+    last = {"breath": None, "dream": None}
+    for event in events:
+        flow = event.get("flow")
+        if flow in last and last[flow] is None:
+            last[flow] = _summarize_surface_event(event)
+        if all(last.values()):
+            break
+    return last
+
+
+@mcp.custom_route("/api/surface-settings", methods=["GET"])
+async def api_surface_settings_get(request):
+    """Breath/Dream caps plus what the most recent breath and dream actually used."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        events = surface_audit.recent(surface_audit.max_events)
+    except Exception as exc:
+        logger.warning("Surface audit read failed for settings: %s", type(exc).__name__)
+        events = []
+    return JSONResponse({
+        "settings": surface_settings.all(),
+        "limits": surface_settings.limits(),
+        "defaults": surface_settings.defaults(),
+        "last": _last_surface_stats(events),
+    })
+
+
+@mcp.custom_route("/api/surface-settings", methods=["POST"])
+async def api_surface_settings_update(request):
+    """Persist new caps; they apply from the next breath()/dream() call."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(body, dict) or not body:
+        return JSONResponse({"error": "expected a non-empty JSON object"}, status_code=400)
+    try:
+        settings = surface_settings.update(body)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        logger.exception("Surface settings write failed")
+        return JSONResponse({"error": type(exc).__name__}, status_code=500)
+    return JSONResponse({"ok": True, "settings": settings})
 
 
 @mcp.custom_route("/api/config", methods=["GET"])
