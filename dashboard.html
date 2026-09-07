@@ -733,11 +733,13 @@
 <div class="content" id="dehydration-view" style="display:none">
   <div class="dehy-toolbar">
     <b>人工脱水审核</b>
-    <select id="dehy-scope" onchange="loadDehydrationQueue()">
+    <select id="dehy-scope" onchange="onDehyScopeChange()">
       <option value="today">今天</option>
       <option value="week" selected>最近 7 天</option>
+      <option value="since">自某日起</option>
       <option value="all">全部历史</option>
     </select>
+    <input type="date" id="dehy-since" style="display:none" onchange="loadDehydrationQueue()" title="从这一天（含）起，改过正文的桶">
     <button class="btn-secondary" onclick="loadDehydrationQueue()">刷新</button>
     <span id="dehy-count" style="font-size:12px;color:var(--text-dim);"></span>
     <span style="font-size:12px;color:var(--text-dim);">打开桶不会调用 AI；只有点“生成 AI 草稿”才调用。</span>
@@ -1284,15 +1286,36 @@ async function loadBuckets() {
 let dehydrationQueue = [];
 let currentDehydrationId = null;
 
+function localDateStr(d) {
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+function onDehyScopeChange() {
+  const scope = document.getElementById('dehy-scope').value;
+  const sinceEl = document.getElementById('dehy-since');
+  sinceEl.style.display = scope === 'since' ? '' : 'none';
+  if (scope === 'since' && !sinceEl.value) {
+    // 默认往前推 30 天，用户再自己改
+    const d = new Date(); d.setDate(d.getDate() - 30);
+    sinceEl.value = localDateStr(d);
+  }
+  loadDehydrationQueue();
+}
+
 async function loadDehydrationQueue() {
   const queueEl = document.getElementById('dehy-queue');
   const countEl = document.getElementById('dehy-count');
   const scope = document.getElementById('dehy-scope').value;
   const now = new Date();
-  const reviewerToday = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+  const reviewerToday = localDateStr(now);
   queueEl.innerHTML = '<div class="loading">加载中…</div>';
   try {
-    const query = '?scope=' + encodeURIComponent(scope) + '&today=' + reviewerToday + '&tz_offset=' + now.getTimezoneOffset();
+    let query = '?scope=' + encodeURIComponent(scope) + '&today=' + reviewerToday + '&tz_offset=' + now.getTimezoneOffset();
+    if (scope === 'since') {
+      const since = document.getElementById('dehy-since').value;
+      if (!since) { queueEl.innerHTML = '<div class="loading">先选一个起始日期</div>'; return; }
+      query += '&since=' + encodeURIComponent(since);
+    }
     const res = await authFetch(BASE + '/api/dehydration-queue' + query);
     if (!res) return;
     const data = await res.json();

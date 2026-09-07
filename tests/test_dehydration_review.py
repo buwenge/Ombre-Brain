@@ -240,3 +240,23 @@ async def test_keep_original_does_not_activate(monkeypatch):
 
     assert json.loads(response.body) == {"ok": True}
     update.assert_awaited_once_with("raw", touch=False, verbatim=True)
+
+
+def test_queue_since_scope_keeps_buckets_from_that_day_on():
+    content = "需要人工脱水的一段长记忆。" * 40
+    buckets = [
+        _bucket("new", content, "2026-09-06T08:00:00"),
+        _bucket("edge", content, "2026-08-27T08:00:00"),
+        _bucket("before", content, "2026-08-26T23:00:00"),
+    ]
+
+    rows = server._dehydration_queue_rows(
+        buckets, "since", today=date(2026, 9, 7), since=date(2026, 8, 27),
+    )
+
+    assert [row["id"] for row in rows] == ["new", "edge"]
+
+
+def test_queue_since_scope_requires_date():
+    with pytest.raises(ValueError):
+        server._dehydration_queue_rows([], "since", today=date(2026, 9, 7))

@@ -3143,10 +3143,19 @@ def _dehydration_queue_rows(
     scope: str,
     today=None,
     timezone_offset_minutes: int = 0,
+    since=None,
 ) -> list[dict]:
-    """Build the manual-review queue without reading or changing any cache."""
+    """Build the manual-review queue without reading or changing any cache.
+
+    scope="since" keeps buckets whose effective date falls in [since, today];
+    "week" is the same window with since = today - 6 days."""
     today = today or datetime.now().date()
-    oldest = today - timedelta(days=6)
+    if scope == "week":
+        since = today - timedelta(days=6)
+    elif scope != "since":
+        since = None
+    elif since is None:
+        raise ValueError("scope=since requires a since date")
     rows = []
     for bucket in all_buckets:
         meta = bucket.get("metadata", {})
@@ -3178,7 +3187,7 @@ def _dehydration_queue_rows(
             effective_date = None
         if scope == "today" and effective_date != today:
             continue
-        if scope == "week" and (effective_date is None or effective_date < oldest or effective_date > today):
+        if since is not None and (effective_date is None or effective_date < since or effective_date > today):
             continue
         rows.append({
             "id": bucket["id"],
@@ -3203,8 +3212,8 @@ async def api_dehydration_queue(request):
     err = _require_auth(request)
     if err: return err
     scope = request.query_params.get("scope", "today")
-    if scope not in ("today", "week", "all"):
-        return JSONResponse({"error": "scope must be today, week or all"}, status_code=400)
+    if scope not in ("today", "week", "all", "since"):
+        return JSONResponse({"error": "scope must be today, week, all or since"}, status_code=400)
     try:
         reviewer_today = datetime.fromisoformat(
             request.query_params.get("today", datetime.now().date().isoformat())
@@ -3212,8 +3221,11 @@ async def api_dehydration_queue(request):
         timezone_offset = int(request.query_params.get("tz_offset", "0"))
         if not -840 <= timezone_offset <= 840:
             raise ValueError
-    except (ValueError, TypeError):
-        return JSONResponse({"error": "invalid reviewer date or timezone"}, status_code=400)
+        since = None
+        if scope == "since":
+            since = datetime.fromisoformat(request.query_params["since"]).date()
+    except (ValueError, TypeError, KeyError):
+        return JSONResponse({"error": "invalid reviewer date, timezone or since"}, status_code=400)
     try:
         buckets = await bucket_mgr.list_all(include_archive=False)
         rows = _dehydration_queue_rows(
@@ -3221,6 +3233,7 @@ async def api_dehydration_queue(request):
             scope,
             today=reviewer_today,
             timezone_offset_minutes=timezone_offset,
+            since=since,
         )
         return JSONResponse({"scope": scope, "count": len(rows), "items": rows})
     except Exception as exc:
